@@ -8,10 +8,8 @@ import http from 'http'
 
 const execAsync = promisify(exec)
 
-// Path to yt-dlp (installed via pip, not on PATH by default)
-const YT_DLP = 'C:\\Users\\czsub\\AppData\\Roaming\\Python\\Python314\\Scripts\\yt-dlp.exe'
-// Path to ffmpeg (installed via winget, not on PATH by default)
-const FFMPEG = 'C:\\Users\\czsub\\AppData\\Local\\Microsoft\\WinGet\\Packages\\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\\ffmpeg-8.1.1-full_build\\bin\\ffmpeg.exe'
+const YT_DLP = process.env.YT_DLP_PATH || 'yt-dlp'
+const FFMPEG = process.env.FFMPEG_PATH || 'ffmpeg'
 
 // In-memory cache for video metadata
 const cache = new Map()
