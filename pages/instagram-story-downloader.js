@@ -9,7 +9,7 @@ export default function StoryDownloader() {
   return (
     <>
       <Head>
-        <title>Instagram Story Downloader — Download Stories Free | IgVideoDownloader</title>
+        <title>Instagram Story Downloader - Free HD | IgVideoDownloader</title>
         <meta name="description" content="Download Instagram Stories anonymously and for free. Save stories from any public account in HD." />
         <meta name="keywords" content="instagram story downloader, download instagram story, story saver" />
         <link rel="canonical" href="https://yoursite.com/instagram-story-downloader" />

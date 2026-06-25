@@ -9,7 +9,7 @@ export default function PhotoDownloader() {
   return (
     <>
       <Head>
-        <title>Instagram Photo Downloader — Download Photos Free | IgVideoDownloader</title>
+        <title>Instagram Photo Downloader - Free HD | IgVideoDownloader</title>
         <meta name="description" content="Download Instagram photos in high resolution for free. Save any photo from Instagram with no login." />
         <meta name="keywords" content="instagram photo downloader, download instagram photo, instagram image downloader" />
         <link rel="canonical" href="https://yoursite.com/instagram-photo-downloader" />
