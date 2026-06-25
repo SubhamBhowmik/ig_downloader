@@ -1,0 +1,24 @@
+# Dev dependencies and tooling
+node_modules
+.next
+.git
+.gitignore
+
+# Env files — never bake secrets into image
+.env
+.env.local
+.env*.local
+
+# Docs and config not needed at runtime
+README.md
+AGENTS.md
+CLAUDE.md
+*.md
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode
+.idea
