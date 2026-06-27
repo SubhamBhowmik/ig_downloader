@@ -12,7 +12,7 @@ export default function ReelsDownloader() {
         <title>Instagram Reels Downloader - Free HD | IgVideoDownloader</title>
         <meta name="description" content="Download Instagram Reels in HD quality for free. No login required. Fast and easy Reels downloader." />
         <meta name="keywords" content="instagram reels downloader, download reels, instagram reels video download" />
-        <link rel="canonical" href="https://yoursite.com/instagram-reels-downloader" />
+        <link rel="canonical" href="https://reelsnap.app/instagram-reels-downloader" />
       </Head>
 
       <Navbar />

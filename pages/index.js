@@ -12,7 +12,7 @@ export default function Home() {
         <title>Instagram Video Downloader - Free HD | IgVideoDownloader</title>
         <meta name="description" content="Download Instagram videos, Reels, Stories and Photos for free. No login required. HD quality. Works on all devices." />
         <meta name="keywords" content="instagram video downloader, download instagram video, instagram reels downloader" />
-        <link rel="canonical" href="https://yoursite.com/" />
+        <link rel="canonical" href="https://reelsnap.app/" />
       </Head>
 
       <Navbar />
