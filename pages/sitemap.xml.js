@@ -1,4 +1,4 @@
-const EXTERNAL_DATA_URL = 'https://yoursite.com'
+const EXTERNAL_DATA_URL = 'https://reelsnap.app'
 
 function generateSiteMap() {
   return `<?xml version="1.0" encoding="UTF-8"?>

@@ -6,7 +6,7 @@ export default function Navbar() {
 
   return (
     <nav className="navbar">
-      <Link href="/" className="logo">IgVideoDownloader</Link>
+      <Link href="/" className="logo">ReelSnap</Link>
       
       <button 
         className="mobile-menu-btn"
