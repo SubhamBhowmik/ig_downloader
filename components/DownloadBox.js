@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react'
+import { useState, useRef, useEffect } from 'react'
 
 export default function DownloadBox() {
   const [url, setUrl] = useState('')
@@ -8,6 +8,7 @@ export default function DownloadBox() {
   const [error, setError] = useState('')
   const [activeTab, setActiveTab] = useState('Video')
   const inputRef = useRef(null)
+  const resultRef = useRef(null)
 
   const tabs = ['Video', 'Reels', 'Story', 'Photo', 'Carousel']
 
@@ -33,6 +34,16 @@ export default function DownloadBox() {
       setLoading(false)
     }
   }
+
+  // Auto-scroll to results on mobile after fetch completes
+  useEffect(() => {
+    if (result && !loading && resultRef.current) {
+      const timer = setTimeout(() => {
+        resultRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      }, 100)
+      return () => clearTimeout(timer)
+    }
+  }, [result, loading])
 
   async function handleDownload(formatId, quality, type = 'video') {
     // Detect if browser supports the download attribute on anchor tags
@@ -137,7 +148,7 @@ export default function DownloadBox() {
       )}
 
       {result && (
-        <div className="result">
+        <div className="result" ref={resultRef}>
           {/* Thumbnail + info */}
           <div className="preview-row">
             <div className="preview-thumb-wrapper">
