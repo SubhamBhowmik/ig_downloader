@@ -45,6 +45,13 @@ export default function DownloadBox() {
     }
   }, [result, loading])
 
+  // Detect Instagram in-app browser — it blocks blob downloads, window.open, and fetch-to-blob
+  function isInstagramBrowser() {
+    if (typeof navigator === 'undefined') return false
+    const ua = navigator.userAgent || ''
+    return /Instagram/i.test(ua) || /FBAN/i.test(ua) || /FBAV/i.test(ua)
+  }
+
   async function handleDownload(formatId, quality, type = 'video') {
     // Detect if browser supports the download attribute on anchor tags
     // Firefox Android is the main browser that ignores it
@@ -55,6 +62,14 @@ export default function DownloadBox() {
     const ext = type === 'audio' ? 'mp3' : 'mp4'
     const filename = `${safeTitle}.${ext}`
     const downloadUrl = `/api/download?url=${encodeURIComponent(url.trim())}&format=${formatId}&type=${type}&title=${encodeURIComponent(safeTitle.replace(/-video$|-audio$/, ''))}`
+
+    // Instagram in-app browser: blob downloads and window.open are both blocked.
+    // The only reliable method is direct navigation via window.location.href.
+    if (isInstagramBrowser()) {
+      window.location.href = downloadUrl
+      setTimeout(() => setDownloading(null), 2000)
+      return
+    }
 
     // Firefox Android doesn't support the download attribute at all
     // Best approach for that browser is to open in a new tab (user can save manually)
