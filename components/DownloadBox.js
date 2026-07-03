@@ -108,9 +108,7 @@ export default function DownloadBox() {
                 src={`/api/download?url=${encodeURIComponent(url.trim())}&thumb=1`}
                 alt={result.title}
                 className="preview-thumb"
-                onError={(e) => {
-                  e.target.style.display = 'none'
-                }}
+                onError={(e) => { e.target.style.display = 'none' }}
               />
               <div className="preview-overlay">
                 <div className="preview-play-icon">▶</div>
@@ -121,11 +119,11 @@ export default function DownloadBox() {
             </div>
             <div className="preview-info">
               <p className="preview-title">{result.title || 'Instagram Video'}</p>
-              {hasVideos && <p className="preview-subtitle">{result.videos.length} video quality options</p>}
+              {hasVideos && <p className="preview-subtitle">{result.videos.length} quality option{result.videos.length > 1 ? 's' : ''}</p>}
             </div>
           </div>
 
-          {/* Two-column layout: Left = Videos, Right = Audio */}
+          {/* Two-column layout */}
           <div className="format-columns">
             {/* Left Column — Videos */}
             <div className="format-col">
@@ -144,7 +142,8 @@ export default function DownloadBox() {
                     <span className="fb-left">
                       <span className="fb-icon">{downloading === f.quality ? '⏳' : '⬇'}</span>
                       <span className="fb-label">{f.quality}</span>
-                      <span className="fb-ext">{f.ext.toUpperCase()}</span>
+                      {/* ✅ Fix: use f.ext safely with fallback */}
+                      <span className="fb-ext">{(f.ext || 'mp4').toUpperCase()}</span>
                     </span>
                     <span className="fb-right">{f.filesize ? formatSize(f.filesize) : ''}</span>
                   </button>
@@ -169,7 +168,8 @@ export default function DownloadBox() {
                     <span className="fb-left">
                       <span className="fb-icon">{downloading === f.quality ? '⏳' : '🎵'}</span>
                       <span className="fb-label">{f.quality}</span>
-                      <span className="fb-ext">{f.ext.toUpperCase()}</span>
+                      {/* ✅ Fix: use f.ext safely with fallback */}
+                      <span className="fb-ext">{(f.ext || 'mp3').toUpperCase()}</span>
                     </span>
                     <span className="fb-right">{f.filesize ? formatSize(f.filesize) : ''}</span>
                   </button>
