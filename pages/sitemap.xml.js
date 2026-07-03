@@ -1,43 +1,33 @@
-const EXTERNAL_DATA_URL = 'https://reelsnap.app'
+const SITE_URL = 'https://reelsnap.app'
+
+const pages = [
+  { path: '/', priority: '1.0', changefreq: 'daily' },
+  { path: '/instagram-reels-downloader', priority: '0.9', changefreq: 'weekly' },
+  { path: '/instagram-story-downloader', priority: '0.9', changefreq: 'weekly' },
+  { path: '/instagram-photo-downloader', priority: '0.9', changefreq: 'weekly' },
+  { path: '/privacy-policy', priority: '0.5', changefreq: 'monthly' },
+  { path: '/terms-of-service', priority: '0.5', changefreq: 'monthly' },
+  { path: '/contact', priority: '0.6', changefreq: 'monthly' },
+]
 
 function generateSiteMap() {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-  <url>
-    <loc>${EXTERNAL_DATA_URL}</loc>
-    <changefreq>daily</changefreq>
-    <priority>1.0</priority>
-  </url>
-  <url>
-    <loc>${EXTERNAL_DATA_URL}/instagram-reels-downloader</loc>
-    <changefreq>weekly</changefreq>
-    <priority>0.8</priority>
-  </url>
-  <url>
-    <loc>${EXTERNAL_DATA_URL}/instagram-story-downloader</loc>
-    <changefreq>weekly</changefreq>
-    <priority>0.8</priority>
-  </url>
-  <url>
-    <loc>${EXTERNAL_DATA_URL}/instagram-photo-downloader</loc>
-    <changefreq>weekly</changefreq>
-    <priority>0.8</priority>
-  </url>
+${pages.map(p => `  <url>
+    <loc>${SITE_URL}${p.path}</loc>
+    <lastmod>${new Date().toISOString().split('T')[0]}</lastmod>
+    <changefreq>${p.changefreq}</changefreq>
+    <priority>${p.priority}</priority>
+  </url>`).join('\n')}
 </urlset>`
 }
 
+export default function Sitemap() {}
+
 export async function getServerSideProps({ res }) {
-  const sitemap = generateSiteMap()
-
   res.setHeader('Content-Type', 'text/xml')
-  res.write(sitemap)
+  res.setHeader('Cache-Control', 'public, s-maxage=86400')
+  res.write(generateSiteMap())
   res.end()
-
-  return {
-    props: {},
-  }
-}
-
-export default function Sitemap() {
-  return null
+  return { props: {} }
 }
