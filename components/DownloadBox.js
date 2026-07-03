@@ -39,8 +39,9 @@ export default function DownloadBox() {
     const title = result?.title || 'instagram-video'
     const safeTitle = title.replace(/[^a-zA-Z0-9\u0600-\u06FF\s_-]/g, '').replace(/\s+/g, '-').substring(0, 40)
     const a = document.createElement('a')
-    a.href = `/api/download?url=${encodeURIComponent(url.trim())}&format=${formatId}&type=${type}&title=${encodeURIComponent(safeTitle)}`
-    a.download = `${safeTitle}.${type === 'audio' ? 'mp3' : 'mp4'}`
+    a.href = `/api/download?url=${encodeURIComponent(url.trim())}&format=${formatId}&type=${type}&title=${encodeURIComponent(safeTitle.replace(/-video$|-audio$/, ''))}`
+    const ext = type === 'audio' ? 'mp3' : 'mp4'
+    a.download = `${safeTitle}.${ext}`
     document.body.appendChild(a)
     a.click()
     document.body.removeChild(a)

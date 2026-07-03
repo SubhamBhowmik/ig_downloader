@@ -49,6 +49,32 @@ function proxyImage(imageUrl, res) {
   })
 }
 
+// Fetch thumbnail from Instagram oEmbed API (free, no login needed)
+async function fetchThumbnail(url) {
+  try {
+    const oembedRes = await fetch(
+      `https://graph.facebook.com/v19.0/instagram_oembed?url=${encodeURIComponent(url)}&fields=thumbnail_url&access_token=anonymous`,
+      { headers: { 'User-Agent': 'Mozilla/5.0' } }
+    )
+    const data = await oembedRes.json()
+    if (data.thumbnail_url) return data.thumbnail_url
+  } catch (e) { /* ignore */ }
+
+  // Fallback — try scraping og:image from Instagram page
+  try {
+    const pageRes = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
+      }
+    })
+    const html = await pageRes.text()
+    const match = html.match(/<meta property="og:image" content="([^"]+)"/)
+    if (match) return match[1]
+  } catch (e) { /* ignore */ }
+
+  return null
+}
+
 // Call Cobalt API and return parsed result
 async function fetchFromCobalt(url, mode = 'auto') {
   const response = await fetch(`${COBALT_API}/`, {
@@ -110,6 +136,9 @@ export default async function handler(req, res) {
     if (cached?.data?.thumbnail) {
       return proxyImage(cached.data.thumbnail, res)
     }
+    // Try fetching thumbnail directly
+    const thumbUrl = await fetchThumbnail(url)
+    if (thumbUrl) return proxyImage(thumbUrl, res)
     return res.status(404).json({ error: 'No thumbnail' })
   }
 
@@ -167,11 +196,20 @@ export default async function handler(req, res) {
 
     let data = {}
 
+    // Extract reel/post ID from URL for a cleaner title
+    const igMatch = url.match(/\/(reel|p|tv)\/([A-Za-z0-9_-]+)/)
+    const igId = igMatch ? igMatch[2] : 'instagram'
+    const igType = igMatch ? igMatch[1] : 'video'
+    const autoTitle = igType === 'reel' ? `Instagram Reel ${igId}` : `Instagram Post ${igId}`
+
+    // Fetch thumbnail in parallel
+    const thumbnail = await fetchThumbnail(url)
+
     // Single video/audio
     if (cobaltData.status === 'tunnel' || cobaltData.status === 'redirect') {
       data = {
-        title: 'Instagram Video',
-        thumbnail: null,
+        title: autoTitle,
+        thumbnail,
         duration: 0,
         videos: [{
           quality: 'HD 1080p',
@@ -209,8 +247,8 @@ export default async function handler(req, res) {
         })) || []
 
       data = {
-        title: 'Instagram Post',
-        thumbnail: cobaltData.picker?.[0]?.thumb || null,
+        title: autoTitle,
+        thumbnail: cobaltData.picker?.[0]?.thumb || thumbnail || null,
         duration: 0,
         videos: [...videos, ...photos],
         audio: cobaltData.audio ? [{
