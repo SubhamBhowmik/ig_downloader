@@ -34,18 +34,54 @@ export default function DownloadBox() {
     }
   }
 
-  function handleDownload(formatId, quality, type = 'video') {
+  async function handleDownload(formatId, quality, type = 'video') {
+    // Detect if browser supports the download attribute on anchor tags
+    // Firefox Android is the main browser that ignores it
+    const supportsDownload = typeof document !== 'undefined' && 'download' in document.createElement('a')
     setDownloading(quality)
     const title = result?.title || 'instagram-video'
     const safeTitle = title.replace(/[^a-zA-Z0-9\u0600-\u06FF\s_-]/g, '').replace(/\s+/g, '-').substring(0, 40)
-    const a = document.createElement('a')
-    a.href = `/api/download?url=${encodeURIComponent(url.trim())}&format=${formatId}&type=${type}&title=${encodeURIComponent(safeTitle.replace(/-video$|-audio$/, ''))}`
     const ext = type === 'audio' ? 'mp3' : 'mp4'
-    a.download = `${safeTitle}.${ext}`
-    document.body.appendChild(a)
-    a.click()
-    document.body.removeChild(a)
-    setTimeout(() => setDownloading(null), 2000)
+    const filename = `${safeTitle}.${ext}`
+    const downloadUrl = `/api/download?url=${encodeURIComponent(url.trim())}&format=${formatId}&type=${type}&title=${encodeURIComponent(safeTitle.replace(/-video$|-audio$/, ''))}`
+
+    // Firefox Android doesn't support the download attribute at all
+    // Best approach for that browser is to open in a new tab (user can save manually)
+    if (!supportsDownload) {
+      window.open(downloadUrl, '_blank')
+      setTimeout(() => setDownloading(null), 2000)
+      return
+    }
+
+    try {
+      // Fetch the file as a blob first — this avoids Android Chrome's download manager issues
+      const response = await fetch(downloadUrl)
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}))
+        throw new Error(errData.error || 'Download failed')
+      }
+
+      const blob = await response.blob()
+      const blobUrl = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = blobUrl
+      a.download = filename
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+
+      // Clean up the blob URL after a delay
+      setTimeout(() => {
+        URL.revokeObjectURL(blobUrl)
+      }, 10000)
+    } catch (err) {
+      // Fallback: try opening directly in a new tab
+      // Works on browsers where blob downloads fail (UC Browser, MIUI Browser, etc.)
+      console.warn('Blob download failed, trying direct fallback:', err.message)
+      window.open(downloadUrl, '_blank')
+    } finally {
+      setTimeout(() => setDownloading(null), 2000)
+    }
   }
 
   function formatDuration(seconds) {
