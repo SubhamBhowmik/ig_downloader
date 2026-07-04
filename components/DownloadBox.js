@@ -17,16 +17,10 @@ export default function DownloadBox() {
     setLoading(true)
     setResult(null)
     setError('')
-
     try {
       const res = await fetch(`/api/download?url=${encodeURIComponent(url.trim())}`)
       const data = await res.json()
-
-      if (!res.ok) {
-        setError(data.error || 'Failed to fetch video')
-        return
-      }
-
+      if (!res.ok) { setError(data.error || 'Failed to fetch video'); return }
       setResult(data)
     } catch (err) {
       setError('Network error. Try again.')
@@ -35,7 +29,6 @@ export default function DownloadBox() {
     }
   }
 
-  // Auto-scroll to results on mobile after fetch completes
   useEffect(() => {
     if (result && !loading && resultRef.current) {
       const timer = setTimeout(() => {
@@ -45,66 +38,42 @@ export default function DownloadBox() {
     }
   }, [result, loading])
 
-  // Detect Instagram in-app browser — it blocks blob downloads, window.open, and fetch-to-blob
-  function isInstagramBrowser() {
-    if (typeof navigator === 'undefined') return false
-    const ua = navigator.userAgent || ''
-    return /Instagram/i.test(ua) || /FBAN/i.test(ua) || /FBAV/i.test(ua)
-  }
-
   async function handleDownload(formatId, quality, type = 'video') {
-    // Detect if browser supports the download attribute on anchor tags
-    // Firefox Android is the main browser that ignores it
-    const supportsDownload = typeof document !== 'undefined' && 'download' in document.createElement('a')
     setDownloading(quality)
     const title = result?.title || 'instagram-video'
-    const safeTitle = title.replace(/[^a-zA-Z0-9\u0600-\u06FF\s_-]/g, '').replace(/\s+/g, '-').substring(0, 40)
+    const safeTitle = title
+      .replace(/[^a-zA-Z0-9\s_-]/g, '')
+      .replace(/\s+/g, '-')
+      .substring(0, 40) || 'instagram-video'
     const ext = type === 'audio' ? 'mp3' : 'mp4'
     const filename = `${safeTitle}.${ext}`
-    const downloadUrl = `/api/download?url=${encodeURIComponent(url.trim())}&format=${formatId}&type=${type}&title=${encodeURIComponent(safeTitle.replace(/-video$|-audio$/, ''))}`
-
-    // Instagram in-app browser: blob downloads and window.open are both blocked.
-    // The only reliable method is direct navigation via window.location.href.
-    if (isInstagramBrowser()) {
-      window.location.href = downloadUrl
-      setTimeout(() => setDownloading(null), 2000)
-      return
-    }
-
-    // Firefox Android doesn't support the download attribute at all
-    // Best approach for that browser is to open in a new tab (user can save manually)
-    if (!supportsDownload) {
-      window.open(downloadUrl, '_blank')
-      setTimeout(() => setDownloading(null), 2000)
-      return
-    }
 
     try {
-      // Fetch the file as a blob first — this avoids Android Chrome's download manager issues
-      const response = await fetch(downloadUrl)
-      if (!response.ok) {
-        const errData = await response.json().catch(() => ({}))
-        throw new Error(errData.error || 'Download failed')
+      // Step 1 — get direct download URL from our API
+      const apiUrl = `/api/download?url=${encodeURIComponent(url.trim())}&format=${formatId}&type=${type}&title=${encodeURIComponent(safeTitle)}`
+      const res = await fetch(apiUrl)
+      const data = await res.json()
+
+      if (!res.ok || !data.directUrl) {
+        setError(data.error || 'Download failed. Try again.')
+        return
       }
 
-      const blob = await response.blob()
-      const blobUrl = URL.createObjectURL(blob)
+      // Step 2 — open direct URL in new tab
+      // This works on ALL browsers and Android devices
+      // The browser handles the full download directly from Cobalt
       const a = document.createElement('a')
-      a.href = blobUrl
+      a.href = data.directUrl
       a.download = filename
+      a.target = '_blank'
+      a.rel = 'noopener noreferrer'
       document.body.appendChild(a)
       a.click()
       document.body.removeChild(a)
 
-      // Clean up the blob URL after a delay
-      setTimeout(() => {
-        URL.revokeObjectURL(blobUrl)
-      }, 10000)
     } catch (err) {
-      // Fallback: try opening directly in a new tab
-      // Works on browsers where blob downloads fail (UC Browser, MIUI Browser, etc.)
-      console.warn('Blob download failed, trying direct fallback:', err.message)
-      window.open(downloadUrl, '_blank')
+      console.error('Download error:', err.message)
+      setError('Download failed. Try again.')
     } finally {
       setTimeout(() => setDownloading(null), 2000)
     }
@@ -132,7 +101,7 @@ export default function DownloadBox() {
           onKeyDown={e => e.key === 'Enter' && handleFetch()}
         />
         <button className="btn-paste" onClick={() =>
-          navigator.clipboard.readText().then(setUrl)
+          navigator.clipboard.readText().then(setUrl).catch(() => {})
         }>
           Paste
         </button>
@@ -164,7 +133,6 @@ export default function DownloadBox() {
 
       {result && (
         <div className="result" ref={resultRef}>
-          {/* Thumbnail + info */}
           <div className="preview-row">
             <div className="preview-thumb-wrapper">
               <img
@@ -182,13 +150,15 @@ export default function DownloadBox() {
             </div>
             <div className="preview-info">
               <p className="preview-title">{result.title || 'Instagram Video'}</p>
-              {hasVideos && <p className="preview-subtitle">{result.videos.length} quality option{result.videos.length > 1 ? 's' : ''}</p>}
+              {hasVideos && (
+                <p className="preview-subtitle">
+                  {result.videos.length} quality option{result.videos.length > 1 ? 's' : ''}
+                </p>
+              )}
             </div>
           </div>
 
-          {/* Two-column layout */}
           <div className="format-columns">
-            {/* Left Column — Videos */}
             <div className="format-col">
               <div className="format-col-header video-header">
                 <span className="header-icon">🎬</span> Video
@@ -205,7 +175,6 @@ export default function DownloadBox() {
                     <span className="fb-left">
                       <span className="fb-icon">{downloading === f.quality ? '⏳' : '⬇'}</span>
                       <span className="fb-label">{f.quality}</span>
-                      {/* ✅ Fix: use f.ext safely with fallback */}
                       <span className="fb-ext">{(f.ext || 'mp4').toUpperCase()}</span>
                     </span>
                     <span className="fb-right">{f.filesize ? formatSize(f.filesize) : ''}</span>
@@ -214,7 +183,6 @@ export default function DownloadBox() {
               </div>
             </div>
 
-            {/* Right Column — Audio Only */}
             <div className="format-col">
               <div className="format-col-header audio-header">
                 <span className="header-icon">🎵</span> Audio
@@ -231,7 +199,6 @@ export default function DownloadBox() {
                     <span className="fb-left">
                       <span className="fb-icon">{downloading === f.quality ? '⏳' : '🎵'}</span>
                       <span className="fb-label">{f.quality}</span>
-                      {/* ✅ Fix: use f.ext safely with fallback */}
                       <span className="fb-ext">{(f.ext || 'mp3').toUpperCase()}</span>
                     </span>
                     <span className="fb-right">{f.filesize ? formatSize(f.filesize) : ''}</span>
@@ -253,11 +220,7 @@ export default function DownloadBox() {
 function formatSize(bytes) {
   if (!bytes) return ''
   const units = ['B', 'KB', 'MB', 'GB']
-  let i = 0
-  let size = bytes
-  while (size >= 1024 && i < units.length - 1) {
-    size /= 1024
-    i++
-  }
+  let i = 0, size = bytes
+  while (size >= 1024 && i < units.length - 1) { size /= 1024; i++ }
   return `${size.toFixed(1)} ${units[i]}`
 }
