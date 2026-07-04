@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, createWriteStream, createReadStream, unlinkSync, statSync, readFileSync } from 'fs'
+import { existsSync, mkdirSync, createWriteStream, createReadStream, unlinkSync, statSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import https from 'https'
@@ -53,13 +53,35 @@ async function fetchThumbnail(url) {
   return null
 }
 
+// Clean Instagram URL — remove tracking params that confuse Cobalt
+function cleanInstagramUrl(rawUrl) {
+  try {
+    const u = new URL(rawUrl)
+    // Keep only the path — remove all query params
+    const match = u.pathname.match(/^\/(reel|p|tv)\/([A-Za-z0-9_-]+)/)
+    if (match) {
+      return `https://www.instagram.com/${match[1]}/${match[2]}/`
+    }
+    return rawUrl
+  } catch (e) {
+    return rawUrl
+  }
+}
+
 async function fetchFromCobalt(url, mode = 'auto') {
+  const cleanUrl = cleanInstagramUrl(url)
+  console.log('Cobalt request URL:', cleanUrl)
+  console.log('Cobalt mode:', mode)
+
   const response = await fetch(`${COBALT_API}/`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
     body: JSON.stringify({
-      url, videoQuality: '1080', audioFormat: 'mp3',
-      filenameStyle: 'basic', downloadMode: mode
+      url: cleanUrl,
+      videoQuality: '1080',
+      audioFormat: 'mp3',
+      filenameStyle: 'basic',
+      downloadMode: mode
     })
   })
   const data = await response.json()
@@ -68,13 +90,10 @@ async function fetchFromCobalt(url, mode = 'auto') {
   return data
 }
 
-// Download with redirect following and debug logging
-function downloadFileToDisk(fileUrl, destPath) {
+function downloadFileToDisk(fileUrl, destPath, expectedMime) {
   return new Promise((resolve, reject) => {
     const attempt = (attemptUrl, redirectCount = 0) => {
       if (redirectCount > 10) return reject(new Error('Too many redirects'))
-
-      console.log(`Fetching URL (redirect ${redirectCount}): ${attemptUrl.substring(0, 100)}`)
 
       const isHttps = attemptUrl.startsWith('https')
       const protocol = isHttps ? https : http
@@ -86,58 +105,54 @@ function downloadFileToDisk(fileUrl, destPath) {
         method: 'GET',
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': 'video/mp4,video/*;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.5',
+          'Accept': expectedMime === 'audio' ? 'audio/*,*/*;q=0.8' : 'video/mp4,video/*;q=0.9,*/*;q=0.8',
           'Accept-Encoding': 'identity',
           'Connection': 'keep-alive',
-          'Sec-Fetch-Dest': 'video',
-          'Sec-Fetch-Mode': 'no-cors',
-          'Sec-Fetch-Site': 'cross-site',
           'Referer': 'https://www.instagram.com/',
         },
         timeout: 120000
       }
 
       const req = protocol.request(options, (remoteRes) => {
-        console.log(`Response status: ${remoteRes.statusCode}`)
-        console.log(`Content-Type: ${remoteRes.headers['content-type']}`)
-        console.log(`Content-Length: ${remoteRes.headers['content-length']}`)
+        const status = remoteRes.statusCode
+        const contentType = remoteRes.headers['content-type'] || ''
+        const contentLength = remoteRes.headers['content-length']
+        console.log(`Response: ${status}, Content-Type: ${contentType}, Size: ${contentLength}`)
 
         // Follow redirects
-        if ([301, 302, 303, 307, 308].includes(remoteRes.statusCode)) {
+        if ([301, 302, 303, 307, 308].includes(status)) {
           const location = remoteRes.headers.location
-          console.log(`Redirecting to: ${location?.substring(0, 100)}`)
           if (!location) return reject(new Error('Redirect with no location'))
           remoteRes.resume()
-          return attempt(location.startsWith('http') ? location : `${urlObj.protocol}//${urlObj.hostname}${location}`, redirectCount + 1)
+          const nextUrl = location.startsWith('http') ? location : `${urlObj.protocol}//${urlObj.hostname}${location}`
+          return attempt(nextUrl, redirectCount + 1)
         }
 
-        if (remoteRes.statusCode !== 200) {
+        if (status !== 200) {
           remoteRes.resume()
-          return reject(new Error(`HTTP ${remoteRes.statusCode} from download URL`))
+          return reject(new Error(`HTTP ${status}`))
         }
 
-        const contentType = remoteRes.headers['content-type'] || ''
-        const contentLength = parseInt(remoteRes.headers['content-length'] || '0')
-
-        // If content-type is HTML/JSON, it's an error page not a video
-        if (contentType.includes('text/html') || contentType.includes('application/json')) {
+        // ✅ Detect if Cobalt returned image instead of video
+        if (contentType.startsWith('image/') && expectedMime !== 'image') {
           remoteRes.resume()
-          return reject(new Error(`Got ${contentType} instead of video — Cobalt returned error page`))
+          return reject(new Error(`COBALT_IMAGE_RESPONSE: Cobalt returned image (${contentType}) instead of video`))
+        }
+
+        if (contentType.includes('text/html')) {
+          remoteRes.resume()
+          return reject(new Error('COBALT_HTML_RESPONSE: Cobalt returned HTML error page'))
         }
 
         const fileStream = createWriteStream(destPath)
         let bytesReceived = 0
-
         remoteRes.on('data', chunk => { bytesReceived += chunk.length })
         remoteRes.pipe(fileStream)
-
         fileStream.on('finish', () => {
           fileStream.close()
-          console.log(`Download complete: ${bytesReceived} bytes`)
-          resolve({ bytesReceived, contentType, contentLength })
+          console.log(`Downloaded: ${bytesReceived} bytes, type: ${contentType}`)
+          resolve({ bytesReceived, contentType })
         })
-
         fileStream.on('error', reject)
         remoteRes.on('error', reject)
       })
@@ -186,26 +201,28 @@ export default async function handler(req, res) {
 
       let fileUrl = null
       if (data.status === 'tunnel' || data.status === 'redirect') fileUrl = data.url
-      else if (data.status === 'picker' && data.picker?.length > 0) fileUrl = data.picker[0].url
+      else if (data.status === 'picker' && data.picker?.length > 0) {
+        // For picker — find video item, not photo
+        const videoItem = data.picker.find(p => p.type === 'video')
+        fileUrl = videoItem ? videoItem.url : data.picker[0].url
+      }
 
       if (!fileUrl) return res.status(500).json({ error: 'No download URL from Cobalt' })
 
-      const { bytesReceived, contentType } = await downloadFileToDisk(fileUrl, tempPath)
+      const expectedMime = isAudio ? 'audio' : 'video'
+      const { bytesReceived, contentType } = await downloadFileToDisk(fileUrl, tempPath, expectedMime)
       const stat = statSync(tempPath)
 
-      console.log(`Final file: ${stat.size} bytes, type: ${contentType}`)
-
       if (stat.size < 50000) {
-        // Read first 200 bytes to debug what we got
-        const sample = readFileSync(tempPath).slice(0, 200).toString()
-        console.log('File content sample:', sample)
         try { unlinkSync(tempPath) } catch (e) {}
-        return res.status(500).json({
-          error: `File too small (${stat.size} bytes). Content type: ${contentType}. Sample: ${sample.substring(0, 100)}`
-        })
+        return res.status(500).json({ error: `File too small (${stat.size} bytes) — this post may be a photo, not a video` })
       }
 
-      const mimeType = isAudio ? 'audio/mpeg' : 'video/mp4'
+      // Use actual content-type from response
+      const mimeType = contentType.startsWith('video') ? 'video/mp4'
+        : contentType.startsWith('audio') ? 'audio/mpeg'
+        : isAudio ? 'audio/mpeg' : 'video/mp4'
+
       const encodedName = encodeURIComponent(filename)
       res.writeHead(200, {
         'Content-Type': mimeType,
@@ -225,7 +242,12 @@ export default async function handler(req, res) {
     } catch (err) {
       console.error('Download error:', err.message)
       try { if (existsSync(tempPath)) unlinkSync(tempPath) } catch (e) {}
-      if (!res.headersSent) return res.status(500).json({ error: err.message })
+      if (!res.headersSent) {
+        if (err.message.includes('COBALT_IMAGE_RESPONSE')) {
+          return res.status(500).json({ error: 'This post appears to be a photo, not a video. Try a Reel or video post.' })
+        }
+        return res.status(500).json({ error: err.message })
+      }
     }
     return
   }
