@@ -1,18 +1,30 @@
-import { existsSync, mkdirSync } from 'fs'
+import { existsSync, mkdirSync, createWriteStream, createReadStream, unlinkSync, statSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import https from 'https'
 import http from 'http'
 
 const COBALT_API = process.env.COBALT_API_URL || 'https://cobalt-production-f33d.up.railway.app'
-
 const cache = new Map()
 const CACHE_TTL = 5 * 60 * 1000
-
 const TMP_DIR = join(tmpdir(), 'ig-downloads')
 if (!existsSync(TMP_DIR)) mkdirSync(TMP_DIR, { recursive: true })
 
-// Proxy thumbnail
+// Clean up old temp files
+setInterval(() => {
+  try {
+    const fs = require('fs')
+    const files = fs.readdirSync(TMP_DIR)
+    const now = Date.now()
+    files.forEach(f => {
+      try {
+        const fp = join(TMP_DIR, f)
+        if (now - fs.statSync(fp).mtimeMs > 15 * 60 * 1000) unlinkSync(fp)
+      } catch (e) {}
+    })
+  } catch (e) {}
+}, 2 * 60 * 1000)
+
 function proxyImage(imageUrl, res) {
   const protocol = imageUrl.startsWith('https') ? https : http
   protocol.get(imageUrl, {
@@ -21,48 +33,117 @@ function proxyImage(imageUrl, res) {
       'Referer': 'https://www.instagram.com/',
     }
   }, (proxyRes) => {
-    const contentType = proxyRes.headers['content-type'] || 'image/jpeg'
-    res.setHeader('Content-Type', contentType)
+    res.setHeader('Content-Type', proxyRes.headers['content-type'] || 'image/jpeg')
     res.setHeader('Cache-Control', 'public, max-age=86400')
     res.writeHead(proxyRes.statusCode)
     proxyRes.pipe(res)
   }).on('error', () => {
-    if (!res.headersSent) res.status(500).json({ error: 'Failed to load thumbnail' })
+    if (!res.headersSent) res.status(500).json({ error: 'Thumbnail failed' })
   })
 }
 
-// Fetch thumbnail
 async function fetchThumbnail(url) {
   try {
-    const pageRes = await fetch(url, {
+    const r = await fetch(url, {
       headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)' }
     })
-    const html = await pageRes.text()
-    const match = html.match(/<meta property="og:image" content="([^"]+)"/)
-    if (match) return match[1]
+    const html = await r.text()
+    const m = html.match(/<meta property="og:image" content="([^"]+)"/)
+    if (m) return m[1]
   } catch (e) {}
   return null
 }
 
-// Call Cobalt API
 async function fetchFromCobalt(url, mode = 'auto') {
   const response = await fetch(`${COBALT_API}/`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Accept': 'application/json'
-    },
+    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
     body: JSON.stringify({
-      url,
-      videoQuality: '1080',
-      audioFormat: 'mp3',
-      filenameStyle: 'basic',
-      downloadMode: mode
+      url, videoQuality: '1080', audioFormat: 'mp3',
+      filenameStyle: 'basic', downloadMode: mode
     })
   })
   const data = await response.json()
-  console.log('Cobalt response status:', data.status)
+  console.log('Cobalt status:', data.status)
   return data
+}
+
+// Download file to disk following redirects
+function downloadFileToDisk(fileUrl, destPath) {
+  return new Promise((resolve, reject) => {
+    const attempt = (attemptUrl, redirectCount = 0) => {
+      if (redirectCount > 5) return reject(new Error('Too many redirects'))
+
+      const isHttps = attemptUrl.startsWith('https')
+      const protocol = isHttps ? https : http
+
+      const options = {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Accept': '*/*',
+          'Accept-Encoding': 'identity',
+          'Connection': 'keep-alive',
+        },
+        timeout: 120000 // 2 minute timeout for large files
+      }
+
+      const req = protocol.get(attemptUrl, options, (remoteRes) => {
+        // Follow redirects
+        if ([301, 302, 303, 307, 308].includes(remoteRes.statusCode)) {
+          const location = remoteRes.headers.location
+          if (!location) return reject(new Error('Redirect with no location'))
+          remoteRes.resume()
+          return attempt(location, redirectCount + 1)
+        }
+
+        if (remoteRes.statusCode !== 200) {
+          remoteRes.resume()
+          return reject(new Error(`HTTP ${remoteRes.statusCode}`))
+        }
+
+        const contentLength = parseInt(remoteRes.headers['content-length'] || '0')
+        console.log(`Downloading file, expected size: ${contentLength} bytes`)
+
+        const fileStream = createWriteStream(destPath)
+        let bytesReceived = 0
+
+        remoteRes.on('data', chunk => { bytesReceived += chunk.length })
+        remoteRes.pipe(fileStream)
+
+        fileStream.on('finish', () => {
+          fileStream.close()
+          console.log(`Download complete: ${bytesReceived} bytes received`)
+          resolve({ bytesReceived, contentLength })
+        })
+
+        fileStream.on('error', err => {
+          try { unlinkSync(destPath) } catch (e) {}
+          reject(err)
+        })
+
+        remoteRes.on('error', err => {
+          try { unlinkSync(destPath) } catch (e) {}
+          reject(err)
+        })
+      })
+
+      req.on('timeout', () => {
+        req.destroy()
+        reject(new Error('Download timed out'))
+      })
+
+      req.on('error', reject)
+    }
+
+    attempt(fileUrl)
+  })
+}
+
+export const config = {
+  api: {
+    responseLimit: false,
+    bodyParser: false,
+  }
 }
 
 export default async function handler(req, res) {
@@ -70,7 +151,7 @@ export default async function handler(req, res) {
 
   if (!url) return res.status(400).json({ error: 'Missing ?url=' })
 
-  // ── PROXY THUMBNAIL ──
+  // ── THUMBNAIL ──
   if (thumb === '1') {
     const cached = cache.get(url)
     if (cached?.data?.thumbnail) return proxyImage(cached.data.thumbnail, res)
@@ -79,10 +160,19 @@ export default async function handler(req, res) {
     return res.status(404).json({ error: 'No thumbnail' })
   }
 
-  // ── GET DIRECT DOWNLOAD URL (no proxying through server) ──
+  // ── DOWNLOAD ──
   if (formatId) {
+    const isAudio = type === 'audio'
+    const safeTitle = (title || 'instagram-video')
+      .replace(/[^a-zA-Z0-9\s_-]/g, '')
+      .replace(/\s+/g, '-')
+      .substring(0, 40) || 'instagram-video'
+    const ext = isAudio ? 'mp3' : 'mp4'
+    const filename = `${safeTitle}.${ext}`
+    const contentType = isAudio ? 'audio/mpeg' : 'video/mp4'
+    const tempPath = join(TMP_DIR, `ig-${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`)
+
     try {
-      const isAudio = type === 'audio'
       const mode = isAudio ? 'audio' : 'auto'
       const data = await fetchFromCobalt(url, mode)
 
@@ -97,18 +187,47 @@ export default async function handler(req, res) {
         fileUrl = data.picker[0].url
       }
 
-      if (!fileUrl) {
-        return res.status(500).json({ error: 'No download URL' })
+      if (!fileUrl) return res.status(500).json({ error: 'No download URL from Cobalt' })
+
+      // Download full file to disk
+      console.log('Starting file download to disk...')
+      await downloadFileToDisk(fileUrl, tempPath)
+
+      // Verify file size
+      const stat = statSync(tempPath)
+      console.log(`File on disk: ${stat.size} bytes`)
+
+      if (stat.size < 10000) {
+        try { unlinkSync(tempPath) } catch (e) {}
+        return res.status(500).json({ error: 'File too small, Cobalt may be rate limiting. Try again in a moment.' })
       }
 
-      // ✅ Return the direct URL to the frontend
-      // Let the browser download directly from Cobalt — no timeout issues!
-      return res.json({ directUrl: fileUrl })
+      // Serve with complete headers
+      const encodedName = encodeURIComponent(filename)
+      res.writeHead(200, {
+        'Content-Type': contentType,
+        'Content-Length': stat.size,
+        'Content-Disposition': `attachment; filename="${filename}"; filename*=UTF-8''${encodedName}`,
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
+        'Pragma': 'no-cache',
+        'Expires': '0',
+        'Access-Control-Allow-Origin': '*',
+        'X-Content-Type-Options': 'nosniff',
+        'Accept-Ranges': 'bytes',
+      })
+
+      const stream = createReadStream(tempPath)
+      stream.pipe(res)
+      stream.on('end', () => { try { unlinkSync(tempPath) } catch (e) {} })
+      stream.on('error', () => { try { unlinkSync(tempPath) } catch (e) {} })
+      return
 
     } catch (err) {
-      console.error('download error:', err.message)
-      return res.status(500).json({ error: 'Download failed. Try again.' })
+      console.error('Download error:', err.message)
+      try { if (existsSync(tempPath)) unlinkSync(tempPath) } catch (e) {}
+      if (!res.headersSent) return res.status(500).json({ error: `Download failed: ${err.message}` })
     }
+    return
   }
 
   // ── GET VIDEO INFO ──
@@ -117,7 +236,6 @@ export default async function handler(req, res) {
     if (cached && Date.now() - cached.time < CACHE_TTL) return res.json(cached.data)
 
     const cobaltData = await fetchFromCobalt(url, 'auto')
-
     if (cobaltData.status === 'error') {
       return res.status(500).json({ error: cobaltData.error?.code || 'Failed to fetch video' })
     }
@@ -132,27 +250,21 @@ export default async function handler(req, res) {
 
     if (cobaltData.status === 'tunnel' || cobaltData.status === 'redirect') {
       data = {
-        title: autoTitle,
-        thumbnail,
-        duration: 0,
+        title: autoTitle, thumbnail, duration: 0,
         videos: [{ quality: 'HD 1080p', format_id: 'hd', filesize: null }],
         audio: [{ quality: 'MP3', format_id: 'mp3', filesize: null }]
       }
     }
 
     if (cobaltData.status === 'picker') {
-      const videos = cobaltData.picker
-        ?.filter(p => p.type === 'video')
+      const videos = cobaltData.picker?.filter(p => p.type === 'video')
         ?.map((p, i) => ({ quality: `Video ${i + 1}`, format_id: `video_${i}`, filesize: null })) || []
-      const photos = cobaltData.picker
-        ?.filter(p => p.type === 'photo')
+      const photos = cobaltData.picker?.filter(p => p.type === 'photo')
         ?.map((p, i) => ({ quality: `Photo ${i + 1}`, format_id: `photo_${i}`, filesize: null })) || []
-
       data = {
         title: autoTitle,
         thumbnail: cobaltData.picker?.[0]?.thumb || thumbnail || null,
-        duration: 0,
-        videos: [...videos, ...photos],
+        duration: 0, videos: [...videos, ...photos],
         audio: cobaltData.audio ? [{ quality: 'MP3', format_id: 'mp3', filesize: null }] : []
       }
     }
@@ -162,6 +274,6 @@ export default async function handler(req, res) {
 
   } catch (err) {
     console.error('Cobalt error:', err.message)
-    return res.status(500).json({ error: 'Failed to process video. Check the URL and try again.' })
+    return res.status(500).json({ error: 'Failed to process video. Try again.' })
   }
 }

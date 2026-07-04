@@ -31,49 +31,48 @@ export default function DownloadBox() {
 
   useEffect(() => {
     if (result && !loading && resultRef.current) {
-      const timer = setTimeout(() => {
-        resultRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
-      }, 100)
-      return () => clearTimeout(timer)
+      setTimeout(() => resultRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100)
     }
   }, [result, loading])
 
   async function handleDownload(formatId, quality, type = 'video') {
     setDownloading(quality)
+    setError('')
+
     const title = result?.title || 'instagram-video'
-    const safeTitle = title
-      .replace(/[^a-zA-Z0-9\s_-]/g, '')
-      .replace(/\s+/g, '-')
-      .substring(0, 40) || 'instagram-video'
+    const safeTitle = title.replace(/[^a-zA-Z0-9\s_-]/g, '').replace(/\s+/g, '-').substring(0, 40) || 'instagram-video'
     const ext = type === 'audio' ? 'mp3' : 'mp4'
     const filename = `${safeTitle}.${ext}`
+    const downloadUrl = `/api/download?url=${encodeURIComponent(url.trim())}&format=${formatId}&type=${type}&title=${encodeURIComponent(safeTitle)}`
 
     try {
-      // Step 1 — get direct download URL from our API
-      const apiUrl = `/api/download?url=${encodeURIComponent(url.trim())}&format=${formatId}&type=${type}&title=${encodeURIComponent(safeTitle)}`
-      const res = await fetch(apiUrl)
-      const data = await res.json()
+      // Fetch with no timeout limit — server downloads full file first
+      const response = await fetch(downloadUrl)
 
-      if (!res.ok || !data.directUrl) {
-        setError(data.error || 'Download failed. Try again.')
-        return
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}))
+        throw new Error(errData.error || 'Download failed')
       }
 
-      // Step 2 — open direct URL in new tab
-      // This works on ALL browsers and Android devices
-      // The browser handles the full download directly from Cobalt
+      const blob = await response.blob()
+
+      // Verify blob is not empty/corrupt
+      if (blob.size < 10000) {
+        throw new Error('File too small — try again')
+      }
+
+      const blobUrl = URL.createObjectURL(blob)
       const a = document.createElement('a')
-      a.href = data.directUrl
+      a.href = blobUrl
       a.download = filename
-      a.target = '_blank'
-      a.rel = 'noopener noreferrer'
       document.body.appendChild(a)
       a.click()
       document.body.removeChild(a)
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 30000)
 
     } catch (err) {
       console.error('Download error:', err.message)
-      setError('Download failed. Try again.')
+      setError(`Download failed: ${err.message}`)
     } finally {
       setTimeout(() => setDownloading(null), 2000)
     }
@@ -114,11 +113,9 @@ export default function DownloadBox() {
 
       <div className="tabs">
         {tabs.map(tab => (
-          <button
-            key={tab}
+          <button key={tab}
             className={`tab ${activeTab === tab ? 'active' : ''}`}
-            onClick={() => setActiveTab(tab)}
-          >
+            onClick={() => setActiveTab(tab)}>
             {tab}
           </button>
         ))}
@@ -139,7 +136,7 @@ export default function DownloadBox() {
                 src={`/api/download?url=${encodeURIComponent(url.trim())}&thumb=1`}
                 alt={result.title}
                 className="preview-thumb"
-                onError={(e) => { e.target.style.display = 'none' }}
+                onError={e => { e.target.style.display = 'none' }}
               />
               <div className="preview-overlay">
                 <div className="preview-play-icon">▶</div>
@@ -150,11 +147,7 @@ export default function DownloadBox() {
             </div>
             <div className="preview-info">
               <p className="preview-title">{result.title || 'Instagram Video'}</p>
-              {hasVideos && (
-                <p className="preview-subtitle">
-                  {result.videos.length} quality option{result.videos.length > 1 ? 's' : ''}
-                </p>
-              )}
+              {hasVideos && <p className="preview-subtitle">{result.videos.length} quality option{result.videos.length > 1 ? 's' : ''}</p>}
             </div>
           </div>
 
@@ -166,12 +159,9 @@ export default function DownloadBox() {
               <div className="format-list">
                 {!hasVideos && <p className="no-formats">No video formats available</p>}
                 {hasVideos && result.videos.map(f => (
-                  <button
-                    key={f.format_id}
-                    className="format-btn video-btn"
+                  <button key={f.format_id} className="format-btn video-btn"
                     onClick={() => handleDownload(f.format_id, f.quality, 'video')}
-                    disabled={downloading === f.quality}
-                  >
+                    disabled={downloading === f.quality}>
                     <span className="fb-left">
                       <span className="fb-icon">{downloading === f.quality ? '⏳' : '⬇'}</span>
                       <span className="fb-label">{f.quality}</span>
@@ -190,12 +180,9 @@ export default function DownloadBox() {
               <div className="format-list">
                 {!hasAudio && <p className="no-formats">No audio formats available</p>}
                 {hasAudio && result.audio.map(f => (
-                  <button
-                    key={f.format_id}
-                    className="format-btn audio-btn"
+                  <button key={f.format_id} className="format-btn audio-btn"
                     onClick={() => handleDownload(f.format_id, f.quality, 'audio')}
-                    disabled={downloading === f.quality}
-                  >
+                    disabled={downloading === f.quality}>
                     <span className="fb-left">
                       <span className="fb-icon">{downloading === f.quality ? '⏳' : '🎵'}</span>
                       <span className="fb-label">{f.quality}</span>
@@ -209,7 +196,7 @@ export default function DownloadBox() {
           </div>
 
           <p className="result-note">
-            Videos processed from Instagram servers. Audio only downloads available when source has separate audio track.
+            Videos processed from Instagram servers. Audio downloads available when source has separate audio track.
           </p>
         </div>
       )}
