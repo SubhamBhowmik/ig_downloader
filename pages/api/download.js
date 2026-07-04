@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, createWriteStream, createReadStream, unlinkSync, statSync } from 'fs'
+import { existsSync, mkdirSync, createWriteStream, createReadStream, unlinkSync, statSync, readFileSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import https from 'https'
@@ -10,7 +10,6 @@ const CACHE_TTL = 5 * 60 * 1000
 const TMP_DIR = join(tmpdir(), 'ig-downloads')
 if (!existsSync(TMP_DIR)) mkdirSync(TMP_DIR, { recursive: true })
 
-// Clean up old temp files
 setInterval(() => {
   try {
     const fs = require('fs')
@@ -65,44 +64,67 @@ async function fetchFromCobalt(url, mode = 'auto') {
   })
   const data = await response.json()
   console.log('Cobalt status:', data.status)
+  console.log('Cobalt URL:', data.url ? data.url.substring(0, 80) : 'none')
   return data
 }
 
-// Download file to disk following redirects
+// Download with redirect following and debug logging
 function downloadFileToDisk(fileUrl, destPath) {
   return new Promise((resolve, reject) => {
     const attempt = (attemptUrl, redirectCount = 0) => {
-      if (redirectCount > 5) return reject(new Error('Too many redirects'))
+      if (redirectCount > 10) return reject(new Error('Too many redirects'))
+
+      console.log(`Fetching URL (redirect ${redirectCount}): ${attemptUrl.substring(0, 100)}`)
 
       const isHttps = attemptUrl.startsWith('https')
       const protocol = isHttps ? https : http
+      const urlObj = new URL(attemptUrl)
 
       const options = {
+        hostname: urlObj.hostname,
+        path: urlObj.pathname + urlObj.search,
+        method: 'GET',
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          'Accept': '*/*',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'video/mp4,video/*;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.5',
           'Accept-Encoding': 'identity',
           'Connection': 'keep-alive',
+          'Sec-Fetch-Dest': 'video',
+          'Sec-Fetch-Mode': 'no-cors',
+          'Sec-Fetch-Site': 'cross-site',
+          'Referer': 'https://www.instagram.com/',
         },
-        timeout: 120000 // 2 minute timeout for large files
+        timeout: 120000
       }
 
-      const req = protocol.get(attemptUrl, options, (remoteRes) => {
+      const req = protocol.request(options, (remoteRes) => {
+        console.log(`Response status: ${remoteRes.statusCode}`)
+        console.log(`Content-Type: ${remoteRes.headers['content-type']}`)
+        console.log(`Content-Length: ${remoteRes.headers['content-length']}`)
+
         // Follow redirects
         if ([301, 302, 303, 307, 308].includes(remoteRes.statusCode)) {
           const location = remoteRes.headers.location
+          console.log(`Redirecting to: ${location?.substring(0, 100)}`)
           if (!location) return reject(new Error('Redirect with no location'))
           remoteRes.resume()
-          return attempt(location, redirectCount + 1)
+          return attempt(location.startsWith('http') ? location : `${urlObj.protocol}//${urlObj.hostname}${location}`, redirectCount + 1)
         }
 
         if (remoteRes.statusCode !== 200) {
           remoteRes.resume()
-          return reject(new Error(`HTTP ${remoteRes.statusCode}`))
+          return reject(new Error(`HTTP ${remoteRes.statusCode} from download URL`))
         }
 
+        const contentType = remoteRes.headers['content-type'] || ''
         const contentLength = parseInt(remoteRes.headers['content-length'] || '0')
-        console.log(`Downloading file, expected size: ${contentLength} bytes`)
+
+        // If content-type is HTML/JSON, it's an error page not a video
+        if (contentType.includes('text/html') || contentType.includes('application/json')) {
+          remoteRes.resume()
+          return reject(new Error(`Got ${contentType} instead of video — Cobalt returned error page`))
+        }
 
         const fileStream = createWriteStream(destPath)
         let bytesReceived = 0
@@ -112,27 +134,17 @@ function downloadFileToDisk(fileUrl, destPath) {
 
         fileStream.on('finish', () => {
           fileStream.close()
-          console.log(`Download complete: ${bytesReceived} bytes received`)
-          resolve({ bytesReceived, contentLength })
+          console.log(`Download complete: ${bytesReceived} bytes`)
+          resolve({ bytesReceived, contentType, contentLength })
         })
 
-        fileStream.on('error', err => {
-          try { unlinkSync(destPath) } catch (e) {}
-          reject(err)
-        })
-
-        remoteRes.on('error', err => {
-          try { unlinkSync(destPath) } catch (e) {}
-          reject(err)
-        })
+        fileStream.on('error', reject)
+        remoteRes.on('error', reject)
       })
 
-      req.on('timeout', () => {
-        req.destroy()
-        reject(new Error('Download timed out'))
-      })
-
+      req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')) })
       req.on('error', reject)
+      req.end()
     }
 
     attempt(fileUrl)
@@ -140,10 +152,7 @@ function downloadFileToDisk(fileUrl, destPath) {
 }
 
 export const config = {
-  api: {
-    responseLimit: false,
-    bodyParser: false,
-  }
+  api: { responseLimit: false, bodyParser: false }
 }
 
 export default async function handler(req, res) {
@@ -151,7 +160,6 @@ export default async function handler(req, res) {
 
   if (!url) return res.status(400).json({ error: 'Missing ?url=' })
 
-  // ── THUMBNAIL ──
   if (thumb === '1') {
     const cached = cache.get(url)
     if (cached?.data?.thumbnail) return proxyImage(cached.data.thumbnail, res)
@@ -160,16 +168,12 @@ export default async function handler(req, res) {
     return res.status(404).json({ error: 'No thumbnail' })
   }
 
-  // ── DOWNLOAD ──
   if (formatId) {
     const isAudio = type === 'audio'
     const safeTitle = (title || 'instagram-video')
-      .replace(/[^a-zA-Z0-9\s_-]/g, '')
-      .replace(/\s+/g, '-')
-      .substring(0, 40) || 'instagram-video'
+      .replace(/[^a-zA-Z0-9\s_-]/g, '').replace(/\s+/g, '-').substring(0, 40) || 'instagram-video'
     const ext = isAudio ? 'mp3' : 'mp4'
     const filename = `${safeTitle}.${ext}`
-    const contentType = isAudio ? 'audio/mpeg' : 'video/mp4'
     const tempPath = join(TMP_DIR, `ig-${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`)
 
     try {
@@ -181,39 +185,35 @@ export default async function handler(req, res) {
       }
 
       let fileUrl = null
-      if (data.status === 'tunnel' || data.status === 'redirect') {
-        fileUrl = data.url
-      } else if (data.status === 'picker' && data.picker?.length > 0) {
-        fileUrl = data.picker[0].url
-      }
+      if (data.status === 'tunnel' || data.status === 'redirect') fileUrl = data.url
+      else if (data.status === 'picker' && data.picker?.length > 0) fileUrl = data.picker[0].url
 
       if (!fileUrl) return res.status(500).json({ error: 'No download URL from Cobalt' })
 
-      // Download full file to disk
-      console.log('Starting file download to disk...')
-      await downloadFileToDisk(fileUrl, tempPath)
-
-      // Verify file size
+      const { bytesReceived, contentType } = await downloadFileToDisk(fileUrl, tempPath)
       const stat = statSync(tempPath)
-      console.log(`File on disk: ${stat.size} bytes`)
 
-      if (stat.size < 10000) {
+      console.log(`Final file: ${stat.size} bytes, type: ${contentType}`)
+
+      if (stat.size < 50000) {
+        // Read first 200 bytes to debug what we got
+        const sample = readFileSync(tempPath).slice(0, 200).toString()
+        console.log('File content sample:', sample)
         try { unlinkSync(tempPath) } catch (e) {}
-        return res.status(500).json({ error: 'File too small, Cobalt may be rate limiting. Try again in a moment.' })
+        return res.status(500).json({
+          error: `File too small (${stat.size} bytes). Content type: ${contentType}. Sample: ${sample.substring(0, 100)}`
+        })
       }
 
-      // Serve with complete headers
+      const mimeType = isAudio ? 'audio/mpeg' : 'video/mp4'
       const encodedName = encodeURIComponent(filename)
       res.writeHead(200, {
-        'Content-Type': contentType,
+        'Content-Type': mimeType,
         'Content-Length': stat.size,
         'Content-Disposition': `attachment; filename="${filename}"; filename*=UTF-8''${encodedName}`,
         'Cache-Control': 'no-cache, no-store, must-revalidate',
-        'Pragma': 'no-cache',
-        'Expires': '0',
-        'Access-Control-Allow-Origin': '*',
-        'X-Content-Type-Options': 'nosniff',
         'Accept-Ranges': 'bytes',
+        'Access-Control-Allow-Origin': '*',
       })
 
       const stream = createReadStream(tempPath)
@@ -225,12 +225,12 @@ export default async function handler(req, res) {
     } catch (err) {
       console.error('Download error:', err.message)
       try { if (existsSync(tempPath)) unlinkSync(tempPath) } catch (e) {}
-      if (!res.headersSent) return res.status(500).json({ error: `Download failed: ${err.message}` })
+      if (!res.headersSent) return res.status(500).json({ error: err.message })
     }
     return
   }
 
-  // ── GET VIDEO INFO ──
+  // GET VIDEO INFO
   try {
     const cached = cache.get(url)
     if (cached && Date.now() - cached.time < CACHE_TTL) return res.json(cached.data)
