@@ -31,44 +31,80 @@ function cleanInstagramUrl(rawUrl) {
   } catch (e) { return rawUrl }
 }
 
-function extractFromHtml(html) {
-  // Log all meta tags for debugging
-  const allMeta = html.match(/<meta[^>]+>/g) || []
-  const ogMeta = allMeta.filter(m => m.includes('og:'))
-  console.log('OG meta tags found:', ogMeta.length)
-  ogMeta.forEach(m => console.log(' ', m.substring(0, 150)))
+// ✅ KEY FIX: handle both single and double quote meta tags
+function getMetaContent(html, property) {
+  // Try double quotes first
+  let m = html.match(new RegExp('<meta property="' + property + '" content="([^"]+)"'))
+  if (m) return m[1]
+  // Try content before property
+  m = html.match(new RegExp('<meta content="([^"]+)" property="' + property + '"'))
+  if (m) return m[1]
+  // Try single quotes
+  m = html.match(new RegExp("<meta property='" + property + "' content='([^']+)'"))
+  if (m) return m[1]
+  m = html.match(new RegExp("<meta content='([^']+)' property='" + property + "'"))
+  if (m) return m[1]
+  // Mixed quotes
+  m = html.match(new RegExp('<meta property="' + property + '" content=\'([^\']+)\''))
+  if (m) return m[1]
+  m = html.match(new RegExp("<meta property='" + property + "' content=\"([^\"]+)\""))
+  if (m) return m[1]
+  return null
+}
 
-  // Try many patterns for video URL
-  const videoPatterns = [
-    // Standard og:video
-    /<meta property="og:video" content="([^"]+)"/,
-    /<meta content="([^"]+)" property="og:video"/,
-    /<meta property='og:video' content='([^']+)'/,
-    /<meta content='([^']+)' property='og:video'/,
-    // og:video:url
-    /<meta property="og:video:url" content="([^"]+)"/,
-    /<meta content="([^"]+)" property="og:video:url"/,
-    // og:video:secure_url
-    /<meta property="og:video:secure_url" content="([^"]+)"/,
-    /<meta content="([^"]+)" property="og:video:secure_url"/,
-    // JSON embedded video URLs
+function decodeHtml(str) {
+  if (!str) return str
+  return str
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#039;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/\\u0026/g, '&')
+    .replace(/\\/g, '')
+}
+
+function extractFromHtml(html) {
+  // Try og:video tags with all quote combinations
+  const videoProps = [
+    'og:video:secure_url',
+    'og:video:url',
+    'og:video',
+  ]
+
+  for (const prop of videoProps) {
+    const val = getMetaContent(html, prop)
+    if (val) {
+      const decoded = decodeHtml(val)
+      console.log('Found ' + prop + ': ' + decoded.substring(0, 100))
+      return decoded
+    }
+  }
+
+  // Try JSON patterns inside script tags
+  const jsonPatterns = [
     /"video_url":"(https:[^"]+)"/,
     /"playable_url":"(https:[^"]+)"/,
     /"playable_url_quality_hd":"(https:[^"]+)"/,
     /"contentUrl":"(https:[^"]+)"/,
-    // MP4 URLs
-    /(https:\/\/[^"'\s]*instagram[^"'\s]*\.mp4[^"'\s]*)/i,
-    /(https:\/\/[^"'\s]*\.mp4\?[^"'\s]*efg=[^"'\s]*)/i,
+    /"downloadUrl":"(https:[^"]+)"/,
   ]
 
-  for (const pattern of videoPatterns) {
+  for (const pattern of jsonPatterns) {
     const m = html.match(pattern)
     if (m) {
-      const videoUrl = m[1].replace(/\\u0026/g, '&').replace(/&amp;/g, '&').replace(/\\/g, '')
-      console.log('Found video with pattern:', pattern.toString().substring(0, 50))
-      console.log('Video URL:', videoUrl.substring(0, 100))
-      return videoUrl
+      const decoded = decodeHtml(m[1])
+      console.log('Found via JSON pattern: ' + decoded.substring(0, 100))
+      return decoded
     }
+  }
+
+  // Try raw mp4 URLs
+  const mp4Match = html.match(/(https:\/\/[^"'\s\\]*\.mp4[^"'\s\\]*)/i)
+  if (mp4Match) {
+    const decoded = decodeHtml(mp4Match[1])
+    console.log('Found raw mp4: ' + decoded.substring(0, 100))
+    return decoded
   }
 
   return null
@@ -79,8 +115,8 @@ async function scrapeInstagramMeta(url) {
   console.log('Scraping:', cleanUrl)
 
   const userAgents = [
-    'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
     'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
+    'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
     'Twitterbot/1.0',
     'WhatsApp/2.23.1 A',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -99,30 +135,33 @@ async function scrapeInstagramMeta(url) {
       })
 
       const html = await res.text()
-      console.log('UA: ' + ua.substring(0, 40) + ' Status: ' + res.status + ' HTML: ' + html.length)
+      console.log('UA: ' + ua.substring(0, 40) + ' | Status: ' + res.status + ' | HTML: ' + html.length)
 
-      if (html.length < 1000) {
-        console.log('Short response:', html.substring(0, 200))
-        continue
-      }
+      if (html.length < 1000) continue
+
+      // Log all meta tags for debugging
+      const allMeta = html.match(/<meta[^>]+>/g) || []
+      const ogMeta = allMeta.filter(m => m.includes('og:'))
+      console.log('OG meta count:', ogMeta.length)
+      ogMeta.slice(0, 10).forEach(m => console.log('  META:', m.substring(0, 200)))
 
       const videoUrl = extractFromHtml(html)
 
-      const imageMatch = html.match(/<meta property="og:image" content="([^"]+)"/) ||
-                        html.match(/<meta content="([^"]+)" property="og:image"/)
-      const thumbnail = imageMatch ? imageMatch[1].replace(/&amp;/g, '&') : null
+      const thumbnail = decodeHtml(
+        getMetaContent(html, 'og:image') ||
+        getMetaContent(html, 'og:image:url')
+      )
 
-      const titleMatch = html.match(/<meta property="og:title" content="([^"]+)"/) ||
-                        html.match(/<meta content="([^"]+)" property="og:title"/)
-      const title = titleMatch ? titleMatch[1] : null
+      const rawTitle = getMetaContent(html, 'og:title')
+      const title = rawTitle ? decodeHtml(rawTitle).replace(/&quot;/g, '"').replace(/&#039;/g, "'") : null
 
       if (videoUrl) {
-        console.log('SUCCESS - video found!')
+        console.log('SUCCESS: video found!')
         return { videoUrl, thumbnail, title }
       }
 
       if (thumbnail) {
-        console.log('Photo only - no video found')
+        console.log('Photo only post')
         return { videoUrl: null, thumbnail, title }
       }
 
@@ -173,7 +212,7 @@ function downloadFileToDisk(fileUrl, destPath) {
       const req = protocol.request(options, (remoteRes) => {
         const status = remoteRes.statusCode
         const contentType = remoteRes.headers['content-type'] || ''
-        console.log('Download: ' + status + ' type: ' + contentType)
+        console.log('Download: ' + status + ' type: ' + contentType + ' size: ' + remoteRes.headers['content-length'])
         if ([301, 302, 303, 307, 308].includes(status)) {
           const location = remoteRes.headers.location
           if (!location) return reject(new Error('Redirect no location'))
@@ -233,6 +272,7 @@ export default async function handler(req, res) {
       const cached = cache.get(url)
       if (cached && cached.data && cached.data.videoUrl) {
         videoUrl = cached.data.videoUrl
+        console.log('Using cached video URL')
       } else {
         const meta = await scrapeInstagramMeta(url)
         videoUrl = meta.videoUrl
@@ -240,6 +280,7 @@ export default async function handler(req, res) {
 
       if (!videoUrl) return res.status(500).json({ error: 'Could not find video URL. Post may be private or photo-only.' })
 
+      console.log('Downloading:', videoUrl.substring(0, 80))
       await downloadFileToDisk(videoUrl, tempPath)
       if (!existsSync(tempPath)) throw new Error('File not created')
       const stat = statSync(tempPath)
