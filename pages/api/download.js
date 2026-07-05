@@ -12,26 +12,27 @@ if (!existsSync(TMP_DIR)) mkdirSync(TMP_DIR, { recursive: true })
 // Optional proxy support via environment variables
 // Set PROXY_URL for all requests, or HTTP_PROXY/HTTPS_PROXY for standard compat
 const PROXY_URL = process.env.PROXY_URL || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || ''
-let proxyAgent = null
+let _proxyAgent = null
+let _proxyInitialized = false
 
-// Try to create a proxy agent if PROXY_URL is configured
-async function initProxyAgent() {
+// Initialize proxy agent lazily (first call to fetchWithProxy)
+async function ensureProxy() {
+  if (_proxyInitialized) return
+  _proxyInitialized = true
   if (!PROXY_URL) return
   try {
-    // undici is bundled with Node 18+ (which Next.js 16 requires)
-    const { ProxyAgent } = await import('undici')
-    proxyAgent = new ProxyAgent(PROXY_URL)
+    const { ProxyAgent } = require('undici')
+    _proxyAgent = new ProxyAgent(PROXY_URL)
     console.log('Proxy agent configured:', PROXY_URL.replace(/:.*@/, ':****@'))
   } catch (e) {
-    console.log('Proxy agent unavailable (undici import failed):', e.message)
+    console.log('Proxy agent unavailable, using direct fetch:', e.message)
   }
 }
-initProxyAgent()
 
-// Helper: fetch with optional proxy support
 async function fetchWithProxy(url, options = {}) {
-  if (proxyAgent) {
-    return fetch(url, { ...options, dispatcher: proxyAgent })
+  await ensureProxy()
+  if (_proxyAgent) {
+    return fetch(url, { ...options, dispatcher: _proxyAgent })
   }
   return fetch(url, options)
 }
