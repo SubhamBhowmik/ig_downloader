@@ -38,18 +38,63 @@ function cleanInstagramUrl(rawUrl) {
 function decodeHtml(str) {
   if (!str) return str
   return str
-    .replace(/&amp;/g, '&')
-    .replace(/&quot;/g, '"')
+    .replace(/&/g, '&')
+    .replace(/"/g, '"')
     .replace(/&#039;/g, "'")
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
+    .replace(/</g, '<')
+    .replace(/>/g, '>')
     .replace(/\\u0026/g, '&')
     .replace(/&#x2019;/g, "'")
     .replace(/&#x201d;/g, '"')
     .replace(/&#x201c;/g, '"')
 }
 
-// Method 1: Instagram GraphQL API (most reliable)
+// Method 1: Instagram's __a=1 endpoint (simplest, no anti-scraping prefix)
+async function fetchViaA1Endpoint(shortcode) {
+  console.log('Trying __a=1 endpoint for:', shortcode)
+  try {
+    const url = 'https://www.instagram.com/p/' + shortcode + '/?__a=1&__d=1'
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': 'https://www.instagram.com/',
+      },
+      signal: AbortSignal.timeout(10000)
+    })
+
+    const text = await res.text()
+    // Instagram wraps responses in for(;;); - strip it if present
+    const jsonText = text.startsWith('for (;;)') ? text.substring(text.indexOf('{')) : text
+    const data = JSON.parse(jsonText)
+
+    let media = data?.items?.[0] || data?.graphql?.shortcode_media || data?.item
+
+    if (!media && data?.graphql) {
+      media = data.graphql.shortcode_media
+    }
+
+    if (!media) {
+      console.log('No media in __a=1 response')
+      return null
+    }
+
+    const videoUrl = media.video_versions?.[0]?.url || media.video_url
+    const thumbnail = media.display_url || media.image_versions2?.candidates?.[0]?.url
+    const title = media.caption?.text || media.edge_media_to_caption?.edges?.[0]?.node?.text || 'Instagram Video'
+
+    if (videoUrl) {
+      console.log('__a=1 SUCCESS - video URL found')
+      return { videoUrl, thumbnail, title }
+    }
+  } catch (e) {
+    console.log('__a=1 failed:', e.message)
+  }
+  return null
+}
+
+// Method 2: Instagram GraphQL API (with for(;;); prefix handling)
 async function fetchViaGraphQL(shortcode) {
   console.log('Trying GraphQL API for:', shortcode)
   try {
@@ -75,26 +120,40 @@ async function fetchViaGraphQL(shortcode) {
         'X-IG-WWW-Claim': '0',
         'Origin': 'https://www.instagram.com',
         'Referer': 'https://www.instagram.com/',
-        'Sec-Fetch-Dest': 'empty',
-        'Sec-Fetch-Mode': 'cors',
-        'Sec-Fetch-Site': 'same-origin',
       },
       body: 'av=0&__d=www&__user=0&__a=1&__req=3&__hs=19734.HYP%3Ainstagram_web_pkg.2.1...&dpr=2&__ccg=EXCELLENT&__rev=1009050048&__s=zvqlv6%3Afxnm6z%3Ae24hmk&__hsi=7318087949012428025&__dyn=7xeUjG1mxu1syUbFp41twpUnwgU7SbzEdF8aUco2qwJyEiw9-2u3p4U2O4m85ildl0q&__csr=&__comet_req=7&fb_dtsg=&jazoest=&lsd=AVp2gEuM&__spin_r=1009050048&__spin_b=trunk&__spin_t=1702565935&fb_api_caller_class=RelayModern&fb_api_req_friendly_name=PolarisPostActionLoadPostQueryQuery&variables=' + encodeURIComponent(variables) + '&server_timestamps=true&doc_id=10015901848480474',
       signal: AbortSignal.timeout(10000)
     })
 
-    const data = await res.json()
-    console.log('GraphQL status:', res.status)
+    // Read as text first, strip the for(;;); prefix that Instagram adds
+    const text = await res.text()
+    const jsonText = text.startsWith('for (;;)') ? text.substring(text.indexOf('{')) : text
+    const data = JSON.parse(jsonText)
 
-    const media = data?.data?.xdt_shortcode_media
+    // Try newer response structure first, fall back to older ones
+    const media = data?.data?.xdt_shortcode_media ||
+                  data?.data?.xdt_api__v1__media__shortcode__web_info?.items?.[0] ||
+                  data?.data?.xdt_api__v1__media__shortcode__web_info?.media ||
+                  data?.data?.shortcode_media
+
     if (!media) {
       console.log('No media in GraphQL response')
       return null
     }
 
-    const videoUrl = media.video_url
-    const thumbnail = media.display_url || media.thumbnail_src
-    const title = media.edge_media_to_caption?.edges?.[0]?.node?.text || 'Instagram Video'
+    // Get video URL - try multiple possible field names
+    const videoUrl = media.video_url ||
+                    media.video_versions?.[0]?.url ||
+                    media.video?.playable_url ||
+                    media.playable_url
+
+    const thumbnail = media.display_url ||
+                     media.image_versions2?.candidates?.[0]?.url ||
+                     media.thumbnail_src
+
+    const title = media.edge_media_to_caption?.edges?.[0]?.node?.text ||
+                 media.caption?.text ||
+                 'Instagram Video'
 
     if (videoUrl) {
       console.log('GraphQL SUCCESS - video URL found')
@@ -106,7 +165,7 @@ async function fetchViaGraphQL(shortcode) {
   return null
 }
 
-// Method 2: Instagram oEmbed API
+// Method 3: Instagram oEmbed API
 async function fetchViaOEmbed(url) {
   console.log('Trying oEmbed API')
   try {
@@ -126,7 +185,7 @@ async function fetchViaOEmbed(url) {
   return null
 }
 
-// Method 3: Scrape HTML with multiple UAs
+// Method 4: Scrape HTML with multiple UAs
 async function fetchViaHtml(cleanUrl) {
   console.log('Trying HTML scrape')
   const userAgents = [
@@ -185,7 +244,13 @@ async function fetchViaHtml(cleanUrl) {
 async function getInstagramMedia(url) {
   const { cleanUrl, shortcode, type } = cleanInstagramUrl(url)
 
-  // Try GraphQL first (best source)
+  // Try __a=1 endpoint first (simplest, no anti-scraping prefix)
+  if (shortcode) {
+    const result = await fetchViaA1Endpoint(shortcode)
+    if (result && result.videoUrl) return result
+  }
+
+  // Try GraphQL API (with for(;;); handling)
   if (shortcode) {
     const result = await fetchViaGraphQL(shortcode)
     if (result && result.videoUrl) return result
