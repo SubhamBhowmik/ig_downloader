@@ -26,30 +26,13 @@ function cleanInstagramUrl(rawUrl) {
   try {
     const u = new URL(rawUrl)
     const match = u.pathname.match(/^\/(reel|p|tv)\/([A-Za-z0-9_-]+)/)
-    if (match) return 'https://www.instagram.com/' + match[1] + '/' + match[2] + '/'
-    return rawUrl
-  } catch (e) { return rawUrl }
-}
-
-// ✅ KEY FIX: handle both single and double quote meta tags
-function getMetaContent(html, property) {
-  // Try double quotes first
-  let m = html.match(new RegExp('<meta property="' + property + '" content="([^"]+)"'))
-  if (m) return m[1]
-  // Try content before property
-  m = html.match(new RegExp('<meta content="([^"]+)" property="' + property + '"'))
-  if (m) return m[1]
-  // Try single quotes
-  m = html.match(new RegExp("<meta property='" + property + "' content='([^']+)'"))
-  if (m) return m[1]
-  m = html.match(new RegExp("<meta content='([^']+)' property='" + property + "'"))
-  if (m) return m[1]
-  // Mixed quotes
-  m = html.match(new RegExp('<meta property="' + property + '" content=\'([^\']+)\''))
-  if (m) return m[1]
-  m = html.match(new RegExp("<meta property='" + property + "' content=\"([^\"]+)\""))
-  if (m) return m[1]
-  return null
+    if (match) return { 
+      cleanUrl: 'https://www.instagram.com/' + match[1] + '/' + match[2] + '/',
+      shortcode: match[2],
+      type: match[1]
+    }
+  } catch (e) {}
+  return { cleanUrl: rawUrl, shortcode: null, type: null }
 }
 
 function decodeHtml(str) {
@@ -61,65 +44,95 @@ function decodeHtml(str) {
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/\\u0026/g, '&')
-    .replace(/\\/g, '')
+    .replace(/&#x2019;/g, "'")
+    .replace(/&#x201d;/g, '"')
+    .replace(/&#x201c;/g, '"')
 }
 
-function extractFromHtml(html) {
-  // Try og:video tags with all quote combinations
-  const videoProps = [
-    'og:video:secure_url',
-    'og:video:url',
-    'og:video',
-  ]
+// Method 1: Instagram GraphQL API (most reliable)
+async function fetchViaGraphQL(shortcode) {
+  console.log('Trying GraphQL API for:', shortcode)
+  try {
+    const apiUrl = 'https://www.instagram.com/api/graphql'
+    const variables = JSON.stringify({
+      shortcode,
+      fetch_comment_count: 0,
+      fetch_related_count: 0,
+      child_comment_count: 0,
+      fetch_like_count: 0,
+      has_threaded_comments: false,
+    })
 
-  for (const prop of videoProps) {
-    const val = getMetaContent(html, prop)
-    if (val) {
-      const decoded = decodeHtml(val)
-      console.log('Found ' + prop + ': ' + decoded.substring(0, 100))
-      return decoded
+    const res = await fetch(apiUrl, {
+      method: 'POST',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'X-IG-App-ID': '936619743392459',
+        'X-ASBD-ID': '129477',
+        'X-IG-WWW-Claim': '0',
+        'Origin': 'https://www.instagram.com',
+        'Referer': 'https://www.instagram.com/',
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'same-origin',
+      },
+      body: 'av=0&__d=www&__user=0&__a=1&__req=3&__hs=19734.HYP%3Ainstagram_web_pkg.2.1...&dpr=2&__ccg=EXCELLENT&__rev=1009050048&__s=zvqlv6%3Afxnm6z%3Ae24hmk&__hsi=7318087949012428025&__dyn=7xeUjG1mxu1syUbFp41twpUnwgU7SbzEdF8aUco2qwJyEiw9-2u3p4U2O4m85ildl0q&__csr=&__comet_req=7&fb_dtsg=&jazoest=&lsd=AVp2gEuM&__spin_r=1009050048&__spin_b=trunk&__spin_t=1702565935&fb_api_caller_class=RelayModern&fb_api_req_friendly_name=PolarisPostActionLoadPostQueryQuery&variables=' + encodeURIComponent(variables) + '&server_timestamps=true&doc_id=10015901848480474',
+      signal: AbortSignal.timeout(10000)
+    })
+
+    const data = await res.json()
+    console.log('GraphQL status:', res.status)
+
+    const media = data?.data?.xdt_shortcode_media
+    if (!media) {
+      console.log('No media in GraphQL response')
+      return null
     }
-  }
 
-  // Try JSON patterns inside script tags
-  const jsonPatterns = [
-    /"video_url":"(https:[^"]+)"/,
-    /"playable_url":"(https:[^"]+)"/,
-    /"playable_url_quality_hd":"(https:[^"]+)"/,
-    /"contentUrl":"(https:[^"]+)"/,
-    /"downloadUrl":"(https:[^"]+)"/,
-  ]
+    const videoUrl = media.video_url
+    const thumbnail = media.display_url || media.thumbnail_src
+    const title = media.edge_media_to_caption?.edges?.[0]?.node?.text || 'Instagram Video'
 
-  for (const pattern of jsonPatterns) {
-    const m = html.match(pattern)
-    if (m) {
-      const decoded = decodeHtml(m[1])
-      console.log('Found via JSON pattern: ' + decoded.substring(0, 100))
-      return decoded
+    if (videoUrl) {
+      console.log('GraphQL SUCCESS - video URL found')
+      return { videoUrl, thumbnail, title }
     }
+  } catch (e) {
+    console.log('GraphQL failed:', e.message)
   }
-
-  // Try raw mp4 URLs
-  const mp4Match = html.match(/(https:\/\/[^"'\s\\]*\.mp4[^"'\s\\]*)/i)
-  if (mp4Match) {
-    const decoded = decodeHtml(mp4Match[1])
-    console.log('Found raw mp4: ' + decoded.substring(0, 100))
-    return decoded
-  }
-
   return null
 }
 
-async function scrapeInstagramMeta(url) {
-  const cleanUrl = cleanInstagramUrl(url)
-  console.log('Scraping:', cleanUrl)
+// Method 2: Instagram oEmbed API
+async function fetchViaOEmbed(url) {
+  console.log('Trying oEmbed API')
+  try {
+    const oembedUrl = 'https://graph.facebook.com/v18.0/instagram_oembed?url=' + encodeURIComponent(url) + '&maxwidth=640&fields=thumbnail_url,title,html&access_token=&format=json'
+    const res = await fetch(oembedUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      signal: AbortSignal.timeout(8000)
+    })
+    const data = await res.json()
+    if (data.thumbnail_url) {
+      console.log('oEmbed got thumbnail')
+      return { videoUrl: null, thumbnail: data.thumbnail_url, title: data.title }
+    }
+  } catch (e) {
+    console.log('oEmbed failed:', e.message)
+  }
+  return null
+}
 
+// Method 3: Scrape HTML with multiple UAs
+async function fetchViaHtml(cleanUrl) {
+  console.log('Trying HTML scrape')
   const userAgents = [
     'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
     'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
     'Twitterbot/1.0',
-    'WhatsApp/2.23.1 A',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
   ]
 
   for (const ua of userAgents) {
@@ -127,47 +140,68 @@ async function scrapeInstagramMeta(url) {
       const res = await fetch(cleanUrl, {
         headers: {
           'User-Agent': ua,
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept': 'text/html,application/xhtml+xml',
           'Accept-Language': 'en-US,en;q=0.9',
-          'Cache-Control': 'no-cache',
         },
-        signal: AbortSignal.timeout(15000)
+        signal: AbortSignal.timeout(12000)
       })
-
       const html = await res.text()
-      console.log('UA: ' + ua.substring(0, 40) + ' | Status: ' + res.status + ' | HTML: ' + html.length)
 
-      if (html.length < 1000) continue
+      // Try all video URL patterns
+      const videoPatterns = [
+        /<meta property="og:video(?::(?:url|secure_url))?" content="([^"]+)"/,
+        /<meta content="([^"]+)" property="og:video(?::(?:url|secure_url))?"/,
+        /"video_url":"(https:[^"]+)"/,
+        /"playable_url":"(https:[^"]+)"/,
+        /"contentUrl":"(https:[^"]+)"/,
+        /(https:\/\/[^"'\s\\]*cdn[^"'\s\\]*\.mp4[^"'\s\\]*)/i,
+      ]
 
-      // Log all meta tags for debugging
-      const allMeta = html.match(/<meta[^>]+>/g) || []
-      const ogMeta = allMeta.filter(m => m.includes('og:'))
-      console.log('OG meta count:', ogMeta.length)
-      ogMeta.slice(0, 10).forEach(m => console.log('  META:', m.substring(0, 200)))
-
-      const videoUrl = extractFromHtml(html)
-
-      const thumbnail = decodeHtml(
-        getMetaContent(html, 'og:image') ||
-        getMetaContent(html, 'og:image:url')
-      )
-
-      const rawTitle = getMetaContent(html, 'og:title')
-      const title = rawTitle ? decodeHtml(rawTitle).replace(/&quot;/g, '"').replace(/&#039;/g, "'") : null
-
-      if (videoUrl) {
-        console.log('SUCCESS: video found!')
-        return { videoUrl, thumbnail, title }
+      for (const pattern of videoPatterns) {
+        const m = html.match(pattern)
+        if (m) {
+          const videoUrl = decodeHtml(m[1])
+          console.log('HTML scrape found video:', videoUrl.substring(0, 80))
+          const imgMatch = html.match(/<meta property="og:image" content="([^"]+)"/) ||
+                          html.match(/<meta content="([^"]+)" property="og:image"/)
+          const thumbnail = imgMatch ? decodeHtml(imgMatch[1]) : null
+          return { videoUrl, thumbnail, title: null }
+        }
       }
 
-      if (thumbnail) {
-        console.log('Photo only post')
-        return { videoUrl: null, thumbnail, title }
+      // At least get thumbnail
+      const imgMatch = html.match(/<meta property="og:image" content="([^"]+)"/) ||
+                      html.match(/<meta content="([^"]+)" property="og:image"/)
+      if (imgMatch) {
+        return { videoUrl: null, thumbnail: decodeHtml(imgMatch[1]), title: null }
       }
-
     } catch (e) {
-      console.log('UA failed: ' + e.message)
+      console.log('HTML scrape UA failed:', e.message)
     }
+  }
+  return null
+}
+
+async function getInstagramMedia(url) {
+  const { cleanUrl, shortcode, type } = cleanInstagramUrl(url)
+
+  // Try GraphQL first (best source)
+  if (shortcode) {
+    const result = await fetchViaGraphQL(shortcode)
+    if (result && result.videoUrl) return result
+  }
+
+  // Try HTML scraping
+  const htmlResult = await fetchViaHtml(cleanUrl)
+  if (htmlResult && htmlResult.videoUrl) return htmlResult
+
+  // At least return thumbnail if we have it
+  if (htmlResult && htmlResult.thumbnail) return htmlResult
+
+  // Final fallback: oEmbed for thumbnail
+  if (shortcode) {
+    const oembedResult = await fetchViaOEmbed(cleanUrl)
+    if (oembedResult) return oembedResult
   }
 
   return { videoUrl: null, thumbnail: null, title: null }
@@ -197,42 +231,33 @@ function downloadFileToDisk(fileUrl, destPath) {
       const isHttps = attemptUrl.startsWith('https')
       const protocol = isHttps ? https : http
       const urlObj = new URL(attemptUrl)
-      const options = {
+      const req = protocol.request({
         hostname: urlObj.hostname,
         path: urlObj.pathname + urlObj.search,
         method: 'GET',
         headers: {
-          'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
           'Accept': 'video/mp4,video/*;q=0.9,*/*;q=0.8',
           'Accept-Encoding': 'identity',
           'Referer': 'https://www.instagram.com/',
         },
         timeout: 120000
-      }
-      const req = protocol.request(options, (remoteRes) => {
+      }, (remoteRes) => {
         const status = remoteRes.statusCode
         const contentType = remoteRes.headers['content-type'] || ''
         console.log('Download: ' + status + ' type: ' + contentType + ' size: ' + remoteRes.headers['content-length'])
         if ([301, 302, 303, 307, 308].includes(status)) {
           const location = remoteRes.headers.location
-          if (!location) return reject(new Error('Redirect no location'))
+          if (!location) return reject(new Error('No redirect location'))
           remoteRes.resume()
-          const nextUrl = location.startsWith('http') ? location : urlObj.protocol + '//' + urlObj.hostname + location
-          return attempt(nextUrl, redirectCount + 1)
+          return attempt(location.startsWith('http') ? location : urlObj.protocol + '//' + urlObj.hostname + location, redirectCount + 1)
         }
-        if (status !== 200) {
-          remoteRes.resume()
-          return reject(new Error('HTTP ' + status))
-        }
+        if (status !== 200) { remoteRes.resume(); return reject(new Error('HTTP ' + status)) }
         const fileStream = createWriteStream(destPath)
-        let bytesReceived = 0
-        remoteRes.on('data', chunk => { bytesReceived += chunk.length })
+        let bytes = 0
+        remoteRes.on('data', c => { bytes += c.length })
         remoteRes.pipe(fileStream)
-        fileStream.on('finish', () => {
-          fileStream.close()
-          console.log('Downloaded: ' + bytesReceived + ' bytes')
-          resolve({ bytesReceived, contentType })
-        })
+        fileStream.on('finish', () => { fileStream.close(); console.log('Downloaded: ' + bytes + ' bytes'); resolve({ bytes, contentType }) })
         fileStream.on('error', reject)
         remoteRes.on('error', reject)
       })
@@ -244,9 +269,7 @@ function downloadFileToDisk(fileUrl, destPath) {
   })
 }
 
-export const config = {
-  api: { responseLimit: false, bodyParser: false }
-}
+export const config = { api: { responseLimit: false, bodyParser: false } }
 
 export default async function handler(req, res) {
   const { url, format: formatId, thumb, type, title } = req.query
@@ -254,9 +277,9 @@ export default async function handler(req, res) {
 
   if (thumb === '1') {
     const cached = cache.get(url)
-    if (cached && cached.data && cached.data.thumbnail) return proxyImage(cached.data.thumbnail, res)
-    const { thumbnail } = await scrapeInstagramMeta(url)
-    if (thumbnail) return proxyImage(thumbnail, res)
+    if (cached?.data?.thumbnail) return proxyImage(cached.data.thumbnail, res)
+    const result = await getInstagramMedia(url)
+    if (result?.thumbnail) return proxyImage(result.thumbnail, res)
     return res.status(404).json({ error: 'No thumbnail' })
   }
 
@@ -270,17 +293,16 @@ export default async function handler(req, res) {
     try {
       let videoUrl = null
       const cached = cache.get(url)
-      if (cached && cached.data && cached.data.videoUrl) {
+      if (cached?.data?.videoUrl) {
         videoUrl = cached.data.videoUrl
         console.log('Using cached video URL')
       } else {
-        const meta = await scrapeInstagramMeta(url)
-        videoUrl = meta.videoUrl
+        const result = await getInstagramMedia(url)
+        videoUrl = result?.videoUrl
       }
 
-      if (!videoUrl) return res.status(500).json({ error: 'Could not find video URL. Post may be private or photo-only.' })
+      if (!videoUrl) return res.status(500).json({ error: 'Could not find video. Post may be private or photo-only.' })
 
-      console.log('Downloading:', videoUrl.substring(0, 80))
       await downloadFileToDisk(videoUrl, tempPath)
       if (!existsSync(tempPath)) throw new Error('File not created')
       const stat = statSync(tempPath)
@@ -315,21 +337,22 @@ export default async function handler(req, res) {
     const cached = cache.get(url)
     if (cached && Date.now() - cached.time < CACHE_TTL) return res.json(cached.data)
 
-    const { videoUrl, thumbnail, title: igTitle } = await scrapeInstagramMeta(url)
+    const result = await getInstagramMedia(url)
     const igMatch = url.match(/\/(reel|p|tv)\/([A-Za-z0-9_-]+)/)
     const igId = igMatch ? igMatch[2] : 'post'
     const igType = igMatch ? igMatch[1] : 'video'
-    const autoTitle = igTitle || (igType === 'reel' ? 'Instagram Reel ' + igId : 'Instagram Post ' + igId)
+    const autoTitle = result?.title || (igType === 'reel' ? 'Instagram Reel ' + igId : 'Instagram Post ' + igId)
 
     let data = {}
-    if (videoUrl) {
+    if (result?.videoUrl) {
       data = {
-        title: autoTitle, thumbnail, videoUrl, duration: 0,
+        title: autoTitle, thumbnail: result.thumbnail,
+        videoUrl: result.videoUrl, duration: 0,
         videos: [{ quality: 'HD', format_id: 'hd', ext: 'mp4', filesize: null }],
         audio: [{ quality: 'MP3', format_id: 'mp3', ext: 'mp3', filesize: null }]
       }
-    } else if (thumbnail) {
-      data = { title: autoTitle, thumbnail, videoUrl: null, duration: 0, videos: [], audio: [], isPhotoOnly: true }
+    } else if (result?.thumbnail) {
+      data = { title: autoTitle, thumbnail: result.thumbnail, videoUrl: null, duration: 0, videos: [], audio: [], isPhotoOnly: true }
     } else {
       return res.status(500).json({ error: 'Could not fetch info. Post may be private.' })
     }
@@ -337,7 +360,7 @@ export default async function handler(req, res) {
     cache.set(url, { data, time: Date.now() })
     return res.json(data)
   } catch (err) {
-    console.error('Scrape error:', err.message)
+    console.error('Error:', err.message)
     return res.status(500).json({ error: 'Failed to process. Try again.' })
   }
 }
