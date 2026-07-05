@@ -9,6 +9,33 @@ const CACHE_TTL = 5 * 60 * 1000
 const TMP_DIR = join(tmpdir(), 'ig-downloads')
 if (!existsSync(TMP_DIR)) mkdirSync(TMP_DIR, { recursive: true })
 
+// Optional proxy support via environment variables
+// Set PROXY_URL for all requests, or HTTP_PROXY/HTTPS_PROXY for standard compat
+const PROXY_URL = process.env.PROXY_URL || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || ''
+let proxyAgent = null
+
+// Try to create a proxy agent if PROXY_URL is configured
+async function initProxyAgent() {
+  if (!PROXY_URL) return
+  try {
+    // undici is bundled with Node 18+ (which Next.js 16 requires)
+    const { ProxyAgent } = await import('undici')
+    proxyAgent = new ProxyAgent(PROXY_URL)
+    console.log('Proxy agent configured:', PROXY_URL.replace(/:.*@/, ':****@'))
+  } catch (e) {
+    console.log('Proxy agent unavailable (undici import failed):', e.message)
+  }
+}
+initProxyAgent()
+
+// Helper: fetch with optional proxy support
+async function fetchWithProxy(url, options = {}) {
+  if (proxyAgent) {
+    return fetch(url, { ...options, dispatcher: proxyAgent })
+  }
+  return fetch(url, options)
+}
+
 setInterval(() => {
   try {
     const fs = require('fs')
@@ -49,12 +76,92 @@ function decodeHtml(str) {
     .replace(/&#x201c;/g, '"')
 }
 
-// Method 1: Instagram's __a=1 endpoint (simplest, no anti-scraping prefix)
+// Method 1: Instagram embed page (most reliable from server IPs)
+// The /embed/ endpoint is designed for public iframe embeds and is less aggressively blocked
+async function fetchViaEmbedPage(shortcode) {
+  console.log('Trying embed page for:', shortcode)
+  try {
+    const url = 'https://www.instagram.com/p/' + shortcode + '/embed/'
+    const res = await fetchWithProxy(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+      signal: AbortSignal.timeout(12000)
+    })
+    const html = await res.text()
+
+    // Method A: Parse application/ld+json (structured data)
+    const ldMatch = html.match(/<script type="application\/ld\+json">([^<]+)<\/script>/)
+    if (ldMatch) {
+      try {
+        const ldData = JSON.parse(ldMatch[1])
+        const videoUrl = ldData?.video?.contentUrl || ldData?.contentUrl
+        const thumbnail = ldData?.thumbnailUrl?.[0] || ldData?.thumbnailUrl
+        const title = ldData?.name || ldData?.headline || 'Instagram Video'
+        if (videoUrl) {
+          console.log('Embed ld+json SUCCESS - video URL found')
+          return { videoUrl, thumbnail, title }
+        }
+      } catch (e) {
+        console.log('Embed ld+json parse error:', e.message)
+      }
+    }
+
+    // Method B: og:video meta tag
+    const ogVideoMatch = html.match(/<meta property="og:video" content="([^"]+)"/) ||
+                         html.match(/<meta content="([^"]+)" property="og:video"/) ||
+                         html.match(/<meta property="og:video:secure_url" content="([^"]+)"/) ||
+                         html.match(/<meta content="([^"]+)" property="og:video:secure_url"/)
+    if (ogVideoMatch) {
+      const videoUrl = decodeHtml(ogVideoMatch[1])
+      const imgMatch = html.match(/<meta property="og:image" content="([^"]+)"/)
+      const thumbnail = imgMatch ? decodeHtml(imgMatch[1]) : null
+      console.log('Embed og:video SUCCESS')
+      return { videoUrl, thumbnail, title: null }
+    }
+
+    // Method C: JSON data in script tags (Instagram puts __INITIAL_STATE__ in embed)
+    const stateMatch = html.match(/window\.__INITIAL_STATE__\s*=\s*({.+?});/s)
+    if (stateMatch) {
+      try {
+        const stateData = JSON.parse(stateMatch[1])
+        const media = stateData?.shortcode_media
+        if (media) {
+          const videoUrl = media.video_url || media.video_versions?.[0]?.url
+          const thumbnail = media.display_url || media.thumbnail_src
+          const title = media.edge_media_to_caption?.edges?.[0]?.node?.text || 'Instagram Video'
+          if (videoUrl) {
+            console.log('Embed __INITIAL_STATE__ SUCCESS')
+            return { videoUrl, thumbnail, title }
+          }
+        }
+      } catch (e) {
+        console.log('Embed __INITIAL_STATE__ parse error:', e.message)
+      }
+    }
+
+    // Method D: Fall back to og:image at least
+    const imgMatch = html.match(/<meta property="og:image" content="([^"]+)"/)
+    if (imgMatch) {
+      console.log('Embed got thumbnail only')
+      return { videoUrl: null, thumbnail: decodeHtml(imgMatch[1]), title: null }
+    }
+
+    console.log('Embed page - no video found (response length:', html.length, ')')
+  } catch (e) {
+    console.log('Embed page failed:', e.message)
+  }
+  return null
+}
+
+// Method 2: Instagram's __a=1 endpoint (simplest, no anti-scraping prefix)
 async function fetchViaA1Endpoint(shortcode) {
   console.log('Trying __a=1 endpoint for:', shortcode)
   try {
     const url = 'https://www.instagram.com/p/' + shortcode + '/?__a=1&__d=1'
-    const res = await fetch(url, {
+    const res = await fetchWithProxy(url, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': '*/*',
@@ -94,7 +201,7 @@ async function fetchViaA1Endpoint(shortcode) {
   return null
 }
 
-// Method 2: Instagram GraphQL API (with for(;;); prefix handling)
+// Method 3: Instagram GraphQL API (with for(;;); prefix handling)
 async function fetchViaGraphQL(shortcode) {
   console.log('Trying GraphQL API for:', shortcode)
   try {
@@ -108,7 +215,7 @@ async function fetchViaGraphQL(shortcode) {
       has_threaded_comments: false,
     })
 
-    const res = await fetch(apiUrl, {
+    const res = await fetchWithProxy(apiUrl, {
       method: 'POST',
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -165,12 +272,12 @@ async function fetchViaGraphQL(shortcode) {
   return null
 }
 
-// Method 3: Instagram oEmbed API
+// Method 4: Instagram oEmbed API
 async function fetchViaOEmbed(url) {
   console.log('Trying oEmbed API')
   try {
     const oembedUrl = 'https://graph.facebook.com/v18.0/instagram_oembed?url=' + encodeURIComponent(url) + '&maxwidth=640&fields=thumbnail_url,title,html&access_token=&format=json'
-    const res = await fetch(oembedUrl, {
+    const res = await fetchWithProxy(oembedUrl, {
       headers: { 'User-Agent': 'Mozilla/5.0' },
       signal: AbortSignal.timeout(8000)
     })
@@ -185,7 +292,7 @@ async function fetchViaOEmbed(url) {
   return null
 }
 
-// Method 4: Scrape HTML with multiple UAs
+// Method 5: Scrape HTML with multiple UAs
 async function fetchViaHtml(cleanUrl) {
   console.log('Trying HTML scrape')
   const userAgents = [
@@ -196,7 +303,7 @@ async function fetchViaHtml(cleanUrl) {
 
   for (const ua of userAgents) {
     try {
-      const res = await fetch(cleanUrl, {
+      const res = await fetchWithProxy(cleanUrl, {
         headers: {
           'User-Agent': ua,
           'Accept': 'text/html,application/xhtml+xml',
@@ -244,7 +351,13 @@ async function fetchViaHtml(cleanUrl) {
 async function getInstagramMedia(url) {
   const { cleanUrl, shortcode, type } = cleanInstagramUrl(url)
 
-  // Try __a=1 endpoint first (simplest, no anti-scraping prefix)
+  // Try embed page first - this is the most reliable from server IPs
+  if (shortcode) {
+    const result = await fetchViaEmbedPage(shortcode)
+    if (result && result.videoUrl) return result
+  }
+
+  // Try __a=1 endpoint second (simple JSON endpoint)
   if (shortcode) {
     const result = await fetchViaA1Endpoint(shortcode)
     if (result && result.videoUrl) return result
@@ -256,7 +369,7 @@ async function getInstagramMedia(url) {
     if (result && result.videoUrl) return result
   }
 
-  // Try HTML scraping
+  // Try HTML scraping with bot UAs
   const htmlResult = await fetchViaHtml(cleanUrl)
   if (htmlResult && htmlResult.videoUrl) return htmlResult
 
