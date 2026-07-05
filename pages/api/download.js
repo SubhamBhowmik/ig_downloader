@@ -3,6 +3,7 @@ import { join } from 'path'
 import { tmpdir } from 'os'
 import https from 'https'
 import http from 'http'
+import { URL } from 'url'
 
 const cache = new Map()
 const CACHE_TTL = 5 * 60 * 1000
@@ -10,31 +11,70 @@ const TMP_DIR = join(tmpdir(), 'ig-downloads')
 if (!existsSync(TMP_DIR)) mkdirSync(TMP_DIR, { recursive: true })
 
 // Optional proxy support via environment variables
-// Set PROXY_URL for all requests, or HTTP_PROXY/HTTPS_PROXY for standard compat
-const PROXY_URL = process.env.PROXY_URL || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || ''
-let _proxyAgent = null
-let _proxyInitialized = false
+// Set PROXY_URL for all requests
+const PROXY_URL = process.env.PROXY_URL || ''
+let _fetchWithProxy = null
 
 // Initialize proxy agent lazily (first call to fetchWithProxy)
 async function ensureProxy() {
-  if (_proxyInitialized) return
-  _proxyInitialized = true
-  if (!PROXY_URL) return
+  if (_fetchWithProxy) return
+  if (!PROXY_URL) {
+    _fetchWithProxy = async (url, options = {}) => fetch(url, options)
+    return
+  }
+
   try {
-    const { ProxyAgent } = require('undici')
-    _proxyAgent = new ProxyAgent(PROXY_URL)
+    const { HttpsProxyAgent } = require('https-proxy-agent')
+    const agent = new HttpsProxyAgent(PROXY_URL)
     console.log('Proxy agent configured:', PROXY_URL.replace(/:.*@/, ':****@'))
+    _fetchWithProxy = async (url, options = {}) => {
+      const urlObj = new URL(url)
+      const isHttps = url.startsWith('https')
+      const module = isHttps ? https : http
+      return new Promise((resolve, reject) => {
+        const req = module.request(urlObj, {
+          agent,
+          method: options.method || 'GET',
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            ...options.headers,
+          },
+          timeout: options.signal ? 15000 : undefined,
+        }, (res) => {
+          const chunks = []
+          res.on('data', chunk => chunks.push(chunk))
+          res.on('end', () => {
+            const body = Buffer.concat(chunks)
+            resolve({
+              status: res.statusCode,
+              headers: res.headers,
+              text: () => body.toString('utf8'),
+              json: () => JSON.parse(body.toString('utf8')),
+              body
+            })
+          })
+        })
+        req.on('error', reject)
+        req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')) })
+        if (options.signal) {
+          options.signal.addEventListener('abort', () => { req.destroy() })
+        }
+        if (options.body) {
+          req.write(options.body)
+        }
+        req.end()
+      })
+    }
+    console.log('Proxy fetch initialized')
   } catch (e) {
     console.log('Proxy agent unavailable, using direct fetch:', e.message)
+    _fetchWithProxy = async (url, options = {}) => fetch(url, options)
   }
 }
 
 async function fetchWithProxy(url, options = {}) {
-  await ensureProxy()
-  if (_proxyAgent) {
-    return fetch(url, { ...options, dispatcher: _proxyAgent })
-  }
-  return fetch(url, options)
+  if (!_fetchWithProxy) await ensureProxy()
+  return _fetchWithProxy(url, options)
 }
 
 setInterval(() => {
@@ -89,7 +129,6 @@ async function fetchViaEmbedPage(shortcode) {
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
       },
-      signal: AbortSignal.timeout(12000)
     })
     const html = await res.text()
 
@@ -144,10 +183,8 @@ async function fetchViaEmbedPage(shortcode) {
     }
 
     // Method D: Search for video URLs in any JSON-like data in the page
-    // Instagram often embeds video URLs in script tags with different structures
     const allScripts = html.match(/<script[^>]*>([\s\S]*?)<\/script>/gi) || []
     for (const script of allScripts) {
-      // Look for video URLs in JSON-like content
       const videoUrlMatches = script.match(/"(?:video_url|playable_url|contentUrl|downloadUrl)"\s*:\s*"(https:[^"]+)"/g)
       if (videoUrlMatches) {
         for (const match of videoUrlMatches) {
@@ -196,11 +233,9 @@ async function fetchViaDdInstagram(shortcode) {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml',
       },
-      signal: AbortSignal.timeout(10000)
     })
     const html = await res.text()
 
-    // ddinstagram embeds the video directly
     const videoMatch = html.match(/<source src="([^"]+)" type="video\/mp4"/) ||
                        html.match(/<video[^>]+src="([^"]+\.mp4[^"]*)"/) ||
                        html.match(/"videoUrl":"(https:[^"]+)"/) ||
@@ -217,7 +252,7 @@ async function fetchViaDdInstagram(shortcode) {
   return null
 }
 
-// Method 2: Instagram's __a=1 endpoint (simplest, no anti-scraping prefix)
+// Method 2: Instagram's __a=1 endpoint
 async function fetchViaA1Endpoint(shortcode) {
   console.log('Trying __a=1 endpoint for:', shortcode)
   try {
@@ -229,20 +264,16 @@ async function fetchViaA1Endpoint(shortcode) {
         'Accept-Language': 'en-US,en;q=0.9',
         'Referer': 'https://www.instagram.com/',
       },
-      signal: AbortSignal.timeout(10000)
     })
 
     const text = await res.text()
-    // Instagram wraps responses in for(;;); - strip it if present
     const jsonText = text.startsWith('for (;;)') ? text.substring(text.indexOf('{')) : text
     const data = JSON.parse(jsonText)
 
     let media = data?.items?.[0] || data?.graphql?.shortcode_media || data?.item
-
     if (!media && data?.graphql) {
       media = data.graphql.shortcode_media
     }
-
     if (!media) {
       console.log('No media in __a=1 response')
       return null
@@ -262,7 +293,7 @@ async function fetchViaA1Endpoint(shortcode) {
   return null
 }
 
-// Method 3: Instagram GraphQL API (with for(;;); prefix handling)
+// Method 3: Instagram GraphQL API
 async function fetchViaGraphQL(shortcode) {
   console.log('Trying GraphQL API for:', shortcode)
   try {
@@ -279,7 +310,7 @@ async function fetchViaGraphQL(shortcode) {
     const res = await fetchWithProxy(apiUrl, {
       method: 'POST',
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         'Accept': '*/*',
         'Accept-Language': 'en-US,en;q=0.9',
         'Content-Type': 'application/x-www-form-urlencoded',
@@ -290,15 +321,12 @@ async function fetchViaGraphQL(shortcode) {
         'Referer': 'https://www.instagram.com/',
       },
       body: 'av=0&__d=www&__user=0&__a=1&__req=3&__hs=19734.HYP%3Ainstagram_web_pkg.2.1...&dpr=2&__ccg=EXCELLENT&__rev=1009050048&__s=zvqlv6%3Afxnm6z%3Ae24hmk&__hsi=7318087949012428025&__dyn=7xeUjG1mxu1syUbFp41twpUnwgU7SbzEdF8aUco2qwJyEiw9-2u3p4U2O4m85ildl0q&__csr=&__comet_req=7&fb_dtsg=&jazoest=&lsd=AVp2gEuM&__spin_r=1009050048&__spin_b=trunk&__spin_t=1702565935&fb_api_caller_class=RelayModern&fb_api_req_friendly_name=PolarisPostActionLoadPostQueryQuery&variables=' + encodeURIComponent(variables) + '&server_timestamps=true&doc_id=10015901848480474',
-      signal: AbortSignal.timeout(10000)
     })
 
-    // Read as text first, strip the for(;;); prefix that Instagram adds
     const text = await res.text()
     const jsonText = text.startsWith('for (;;)') ? text.substring(text.indexOf('{')) : text
     const data = JSON.parse(jsonText)
 
-    // Try newer response structure first, fall back to older ones
     const media = data?.data?.xdt_shortcode_media ||
                   data?.data?.xdt_api__v1__media__shortcode__web_info?.items?.[0] ||
                   data?.data?.xdt_api__v1__media__shortcode__web_info?.media ||
@@ -309,7 +337,6 @@ async function fetchViaGraphQL(shortcode) {
       return null
     }
 
-    // Get video URL - try multiple possible field names
     const videoUrl = media.video_url ||
                     media.video_versions?.[0]?.url ||
                     media.video?.playable_url ||
@@ -340,7 +367,6 @@ async function fetchViaOEmbed(url) {
     const oembedUrl = 'https://graph.facebook.com/v18.0/instagram_oembed?url=' + encodeURIComponent(url) + '&maxwidth=640&fields=thumbnail_url,title,html&access_token=&format=json'
     const res = await fetchWithProxy(oembedUrl, {
       headers: { 'User-Agent': 'Mozilla/5.0' },
-      signal: AbortSignal.timeout(8000)
     })
     const data = await res.json()
     if (data.thumbnail_url) {
@@ -370,11 +396,9 @@ async function fetchViaHtml(cleanUrl) {
           'Accept': 'text/html,application/xhtml+xml',
           'Accept-Language': 'en-US,en;q=0.9',
         },
-        signal: AbortSignal.timeout(12000)
       })
       const html = await res.text()
 
-      // Try all video URL patterns
       const videoPatterns = [
         /<meta property="og:video(?::(?:url|secure_url))?" content="([^"]+)"/,
         /<meta content="([^"]+)" property="og:video(?::(?:url|secure_url))?"/,
@@ -396,7 +420,6 @@ async function fetchViaHtml(cleanUrl) {
         }
       }
 
-      // At least get thumbnail
       const imgMatch = html.match(/<meta property="og:image" content="([^"]+)"/) ||
                       html.match(/<meta content="([^"]+)" property="og:image"/)
       if (imgMatch) {
@@ -412,38 +435,31 @@ async function fetchViaHtml(cleanUrl) {
 async function getInstagramMedia(url) {
   const { cleanUrl, shortcode, type } = cleanInstagramUrl(url)
 
-  // Try embed page first - this is the most reliable from server IPs
   if (shortcode) {
     const result = await fetchViaEmbedPage(shortcode)
     if (result && result.videoUrl) return result
   }
 
-  // Try ddinstagram.com (alternative frontend, less blocked)
   if (shortcode) {
     const result = await fetchViaDdInstagram(shortcode)
     if (result && result.videoUrl) return result
   }
 
-  // Try __a=1 endpoint (simple JSON endpoint)
   if (shortcode) {
     const result = await fetchViaA1Endpoint(shortcode)
     if (result && result.videoUrl) return result
   }
 
-  // Try GraphQL API (with for(;;); handling)
   if (shortcode) {
     const result = await fetchViaGraphQL(shortcode)
     if (result && result.videoUrl) return result
   }
 
-  // Try HTML scraping with bot UAs
   const htmlResult = await fetchViaHtml(cleanUrl)
   if (htmlResult && htmlResult.videoUrl) return htmlResult
 
-  // At least return thumbnail if we have it
   if (htmlResult && htmlResult.thumbnail) return htmlResult
 
-  // Final fallback: oEmbed for thumbnail
   if (shortcode) {
     const oembedResult = await fetchViaOEmbed(cleanUrl)
     if (oembedResult) return oembedResult
