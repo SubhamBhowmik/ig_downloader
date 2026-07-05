@@ -25,10 +25,53 @@ setInterval(() => {
 function cleanInstagramUrl(rawUrl) {
   try {
     const u = new URL(rawUrl)
-    const match = u.pathname.match(/^[/](reel|p|tv)[/]([A-Za-z0-9_-]+)/)
+    const match = u.pathname.match(/^\/(reel|p|tv)\/([A-Za-z0-9_-]+)/)
     if (match) return 'https://www.instagram.com/' + match[1] + '/' + match[2] + '/'
     return rawUrl
   } catch (e) { return rawUrl }
+}
+
+function extractFromHtml(html) {
+  // Log all meta tags for debugging
+  const allMeta = html.match(/<meta[^>]+>/g) || []
+  const ogMeta = allMeta.filter(m => m.includes('og:'))
+  console.log('OG meta tags found:', ogMeta.length)
+  ogMeta.forEach(m => console.log(' ', m.substring(0, 150)))
+
+  // Try many patterns for video URL
+  const videoPatterns = [
+    // Standard og:video
+    /<meta property="og:video" content="([^"]+)"/,
+    /<meta content="([^"]+)" property="og:video"/,
+    /<meta property='og:video' content='([^']+)'/,
+    /<meta content='([^']+)' property='og:video'/,
+    // og:video:url
+    /<meta property="og:video:url" content="([^"]+)"/,
+    /<meta content="([^"]+)" property="og:video:url"/,
+    // og:video:secure_url
+    /<meta property="og:video:secure_url" content="([^"]+)"/,
+    /<meta content="([^"]+)" property="og:video:secure_url"/,
+    // JSON embedded video URLs
+    /"video_url":"(https:[^"]+)"/,
+    /"playable_url":"(https:[^"]+)"/,
+    /"playable_url_quality_hd":"(https:[^"]+)"/,
+    /"contentUrl":"(https:[^"]+)"/,
+    // MP4 URLs
+    /(https:\/\/[^"'\s]*instagram[^"'\s]*\.mp4[^"'\s]*)/i,
+    /(https:\/\/[^"'\s]*\.mp4\?[^"'\s]*efg=[^"'\s]*)/i,
+  ]
+
+  for (const pattern of videoPatterns) {
+    const m = html.match(pattern)
+    if (m) {
+      const videoUrl = m[1].replace(/\\u0026/g, '&').replace(/&amp;/g, '&').replace(/\\/g, '')
+      console.log('Found video with pattern:', pattern.toString().substring(0, 50))
+      console.log('Video URL:', videoUrl.substring(0, 100))
+      return videoUrl
+    }
+  }
+
+  return null
 }
 
 async function scrapeInstagramMeta(url) {
@@ -37,10 +80,10 @@ async function scrapeInstagramMeta(url) {
 
   const userAgents = [
     'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
+    'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
     'Twitterbot/1.0',
     'WhatsApp/2.23.1 A',
-    'LinkedInBot/1.0 (compatible; Mozilla/5.0; Apache-HttpClient/4.1.1 +http://www.linkedin.com)',
-    'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
   ]
 
   for (const ua of userAgents) {
@@ -48,45 +91,46 @@ async function scrapeInstagramMeta(url) {
       const res = await fetch(cleanUrl, {
         headers: {
           'User-Agent': ua,
-          'Accept': 'text/html,application/xhtml+xml',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
           'Accept-Language': 'en-US,en;q=0.9',
+          'Cache-Control': 'no-cache',
         },
-        signal: AbortSignal.timeout(10000)
+        signal: AbortSignal.timeout(15000)
       })
 
       const html = await res.text()
-      console.log('UA: ' + ua.substring(0, 30) + ' Status: ' + res.status + ' HTML: ' + html.length)
+      console.log('UA: ' + ua.substring(0, 40) + ' Status: ' + res.status + ' HTML: ' + html.length)
 
-      const videoMatch = html.match(/<meta property="og:video(?::url)?" content="([^"]+)"/)
-      const videoUrl = videoMatch ? videoMatch[1].replace(/&amp;/g, '&') : null
+      if (html.length < 1000) {
+        console.log('Short response:', html.substring(0, 200))
+        continue
+      }
 
-      const secureMatch = html.match(/<meta property="og:video:secure_url" content="([^"]+)"/)
-      const secureUrl = secureMatch ? secureMatch[1].replace(/&amp;/g, '&') : null
+      const videoUrl = extractFromHtml(html)
 
-      const imageMatch = html.match(/<meta property="og:image" content="([^"]+)"/)
+      const imageMatch = html.match(/<meta property="og:image" content="([^"]+)"/) ||
+                        html.match(/<meta content="([^"]+)" property="og:image"/)
       const thumbnail = imageMatch ? imageMatch[1].replace(/&amp;/g, '&') : null
 
-      const titleMatch = html.match(/<meta property="og:title" content="([^"]+)"/)
+      const titleMatch = html.match(/<meta property="og:title" content="([^"]+)"/) ||
+                        html.match(/<meta content="([^"]+)" property="og:title"/)
       const title = titleMatch ? titleMatch[1] : null
 
-      const finalVideoUrl = secureUrl || videoUrl
-
-      if (finalVideoUrl) {
-        console.log('Found video URL: ' + finalVideoUrl.substring(0, 80))
-        return { videoUrl: finalVideoUrl, thumbnail, title }
+      if (videoUrl) {
+        console.log('SUCCESS - video found!')
+        return { videoUrl, thumbnail, title }
       }
 
       if (thumbnail) {
-        console.log('Photo only post')
+        console.log('Photo only - no video found')
         return { videoUrl: null, thumbnail, title }
       }
 
     } catch (e) {
-      console.log('UA failed: ' + ua.substring(0, 30) + ' ' + e.message)
+      console.log('UA failed: ' + e.message)
     }
   }
 
-  console.log('All user agents failed')
   return { videoUrl: null, thumbnail: null, title: null }
 }
 
@@ -111,11 +155,9 @@ function downloadFileToDisk(fileUrl, destPath) {
   return new Promise((resolve, reject) => {
     const attempt = (attemptUrl, redirectCount) => {
       if (redirectCount > 10) return reject(new Error('Too many redirects'))
-
       const isHttps = attemptUrl.startsWith('https')
       const protocol = isHttps ? https : http
       const urlObj = new URL(attemptUrl)
-
       const options = {
         hostname: urlObj.hostname,
         path: urlObj.pathname + urlObj.search,
@@ -128,13 +170,10 @@ function downloadFileToDisk(fileUrl, destPath) {
         },
         timeout: 120000
       }
-
       const req = protocol.request(options, (remoteRes) => {
         const status = remoteRes.statusCode
         const contentType = remoteRes.headers['content-type'] || ''
-        const contentLength = remoteRes.headers['content-length']
-        console.log('Download: ' + status + ' type: ' + contentType + ' size: ' + contentLength)
-
+        console.log('Download: ' + status + ' type: ' + contentType)
         if ([301, 302, 303, 307, 308].includes(status)) {
           const location = remoteRes.headers.location
           if (!location) return reject(new Error('Redirect no location'))
@@ -142,12 +181,10 @@ function downloadFileToDisk(fileUrl, destPath) {
           const nextUrl = location.startsWith('http') ? location : urlObj.protocol + '//' + urlObj.hostname + location
           return attempt(nextUrl, redirectCount + 1)
         }
-
         if (status !== 200) {
           remoteRes.resume()
           return reject(new Error('HTTP ' + status))
         }
-
         const fileStream = createWriteStream(destPath)
         let bytesReceived = 0
         remoteRes.on('data', chunk => { bytesReceived += chunk.length })
@@ -160,7 +197,6 @@ function downloadFileToDisk(fileUrl, destPath) {
         fileStream.on('error', reject)
         remoteRes.on('error', reject)
       })
-
       req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')) })
       req.on('error', reject)
       req.end()
@@ -175,7 +211,6 @@ export const config = {
 
 export default async function handler(req, res) {
   const { url, format: formatId, thumb, type, title } = req.query
-
   if (!url) return res.status(400).json({ error: 'Missing ?url=' })
 
   if (thumb === '1') {
@@ -188,8 +223,7 @@ export default async function handler(req, res) {
 
   if (formatId) {
     const isAudio = type === 'audio'
-    const safeTitle = (title || 'instagram-video')
-      .replace(/[^a-zA-Z0-9\s_-]/g, '').replace(/\s+/g, '-').substring(0, 40) || 'instagram-video'
+    const safeTitle = (title || 'instagram-video').replace(/[^a-zA-Z0-9\s_-]/g, '').replace(/\s+/g, '-').substring(0, 40) || 'instagram-video'
     const ext = isAudio ? 'mp3' : 'mp4'
     const filename = safeTitle + '.' + ext
     const tempPath = join(TMP_DIR, 'ig-' + Date.now() + '-' + Math.random().toString(36).slice(2) + '.' + ext)
@@ -199,26 +233,19 @@ export default async function handler(req, res) {
       const cached = cache.get(url)
       if (cached && cached.data && cached.data.videoUrl) {
         videoUrl = cached.data.videoUrl
-        console.log('Using cached video URL')
       } else {
         const meta = await scrapeInstagramMeta(url)
         videoUrl = meta.videoUrl
       }
 
-      if (!videoUrl) {
-        return res.status(500).json({ error: 'Could not find video URL. Post may be private or photo-only.' })
-      }
+      if (!videoUrl) return res.status(500).json({ error: 'Could not find video URL. Post may be private or photo-only.' })
 
-      console.log('Downloading from: ' + videoUrl.substring(0, 80))
       await downloadFileToDisk(videoUrl, tempPath)
-
       if (!existsSync(tempPath)) throw new Error('File not created')
       const stat = statSync(tempPath)
-      console.log('File size: ' + stat.size + ' bytes')
-
       if (stat.size < 10000) {
         try { unlinkSync(tempPath) } catch (e) {}
-        return res.status(500).json({ error: 'File too small (' + stat.size + 'b). Try again.' })
+        return res.status(500).json({ error: 'File too small. Try again.' })
       }
 
       const mimeType = isAudio ? 'audio/mpeg' : 'video/mp4'
@@ -231,12 +258,10 @@ export default async function handler(req, res) {
         'Accept-Ranges': 'bytes',
         'Access-Control-Allow-Origin': '*',
       })
-
       const stream = createReadStream(tempPath)
       stream.pipe(res)
       stream.on('end', () => { try { unlinkSync(tempPath) } catch (e) {} })
       stream.on('error', () => { try { unlinkSync(tempPath) } catch (e) {} })
-
     } catch (err) {
       console.error('Download error:', err.message)
       try { if (existsSync(tempPath)) unlinkSync(tempPath) } catch (e) {}
@@ -247,20 +272,15 @@ export default async function handler(req, res) {
 
   try {
     const cached = cache.get(url)
-    if (cached && Date.now() - cached.time < CACHE_TTL) {
-      console.log('Cache hit')
-      return res.json(cached.data)
-    }
+    if (cached && Date.now() - cached.time < CACHE_TTL) return res.json(cached.data)
 
     const { videoUrl, thumbnail, title: igTitle } = await scrapeInstagramMeta(url)
-
     const igMatch = url.match(/\/(reel|p|tv)\/([A-Za-z0-9_-]+)/)
     const igId = igMatch ? igMatch[2] : 'post'
     const igType = igMatch ? igMatch[1] : 'video'
     const autoTitle = igTitle || (igType === 'reel' ? 'Instagram Reel ' + igId : 'Instagram Post ' + igId)
 
     let data = {}
-
     if (videoUrl) {
       data = {
         title: autoTitle, thumbnail, videoUrl, duration: 0,
@@ -268,16 +288,13 @@ export default async function handler(req, res) {
         audio: [{ quality: 'MP3', format_id: 'mp3', ext: 'mp3', filesize: null }]
       }
     } else if (thumbnail) {
-      data = {
-        title: autoTitle, thumbnail, videoUrl: null, duration: 0,
-        videos: [], audio: [], isPhotoOnly: true
-      }
+      data = { title: autoTitle, thumbnail, videoUrl: null, duration: 0, videos: [], audio: [], isPhotoOnly: true }
+    } else {
       return res.status(500).json({ error: 'Could not fetch info. Post may be private.' })
     }
 
     cache.set(url, { data, time: Date.now() })
     return res.json(data)
-
   } catch (err) {
     console.error('Scrape error:', err.message)
     return res.status(500).json({ error: 'Failed to process. Try again.' })
