@@ -272,7 +272,6 @@ export default async function handler(req, res) {
         title: autoTitle, thumbnail, videoUrl: null, duration: 0,
         videos: [], audio: [], isPhotoOnly: true
       }
-    } else {
       return res.status(500).json({ error: 'Could not fetch info. Post may be private.' })
     }
 
