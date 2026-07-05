@@ -142,7 +142,36 @@ async function fetchViaEmbedPage(shortcode) {
       }
     }
 
-    // Method D: Fall back to og:image at least
+    // Method D: Search for video URLs in any JSON-like data in the page
+    // Instagram often embeds video URLs in script tags with different structures
+    const allScripts = html.match(/<script[^>]*>([\s\S]*?)<\/script>/gi) || []
+    for (const script of allScripts) {
+      // Look for video URLs in JSON-like content
+      const videoUrlMatches = script.match(/"(?:video_url|playable_url|contentUrl|downloadUrl)"\s*:\s*"(https:[^"]+)"/g)
+      if (videoUrlMatches) {
+        for (const match of videoUrlMatches) {
+          try {
+            const url = JSON.parse('{' + match + '}')['video_url'] || 
+                       JSON.parse('{' + match + '}')['playable_url'] ||
+                       JSON.parse('{' + match + '}')['contentUrl'] ||
+                       JSON.parse('{' + match + '}')['downloadUrl']
+            if (url && url.includes('cdn') && url.includes('.mp4')) {
+              console.log('Embed script scan SUCCESS - found video URL')
+              return { videoUrl: decodeHtml(url), thumbnail: null, title: null }
+            }
+          } catch (e) {}
+        }
+      }
+    }
+
+    // Method E: Search for any CDN mp4 URLs in the entire HTML
+    const cdnVideoMatch = html.match(/https:\/\/[^"'\s\\]*cdn[^"'\s\\]*\.mp4[^"'\s\\]*/i)
+    if (cdnVideoMatch) {
+      console.log('Embed CDN mp4 SUCCESS')
+      return { videoUrl: decodeHtml(cdnVideoMatch[0]), thumbnail: null, title: null }
+    }
+
+    // Method F: Fall back to og:image at least
     const imgMatch = html.match(/<meta property="og:image" content="([^"]+)"/)
     if (imgMatch) {
       console.log('Embed got thumbnail only')
@@ -152,6 +181,37 @@ async function fetchViaEmbedPage(shortcode) {
     console.log('Embed page - no video found (response length:', html.length, ')')
   } catch (e) {
     console.log('Embed page failed:', e.message)
+  }
+  return null
+}
+
+// Method 1b: Try ddinstagram.com (alternative frontend, less blocked)
+async function fetchViaDdInstagram(shortcode) {
+  console.log('Trying ddinstagram for:', shortcode)
+  try {
+    const url = 'https://ddinstagram.com/p/' + shortcode + '/'
+    const res = await fetchWithProxy(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml',
+      },
+      signal: AbortSignal.timeout(10000)
+    })
+    const html = await res.text()
+
+    // ddinstagram embeds the video directly
+    const videoMatch = html.match(/<source src="([^"]+)" type="video\/mp4"/) ||
+                       html.match(/<video[^>]+src="([^"]+\.mp4[^"]*)"/) ||
+                       html.match(/"videoUrl":"(https:[^"]+)"/) ||
+                       html.match(/"url":"(https:[^"]+\.mp4[^"]*)"/)
+    if (videoMatch) {
+      console.log('ddinstagram SUCCESS')
+      const imgMatch = html.match(/<meta property="og:image" content="([^"]+)"/)
+      return { videoUrl: decodeHtml(videoMatch[1]), thumbnail: imgMatch ? decodeHtml(imgMatch[1]) : null, title: null }
+    }
+    console.log('ddinstagram - no video found')
+  } catch (e) {
+    console.log('ddinstagram failed:', e.message)
   }
   return null
 }
@@ -357,7 +417,13 @@ async function getInstagramMedia(url) {
     if (result && result.videoUrl) return result
   }
 
-  // Try __a=1 endpoint second (simple JSON endpoint)
+  // Try ddinstagram.com (alternative frontend, less blocked)
+  if (shortcode) {
+    const result = await fetchViaDdInstagram(shortcode)
+    if (result && result.videoUrl) return result
+  }
+
+  // Try __a=1 endpoint (simple JSON endpoint)
   if (shortcode) {
     const result = await fetchViaA1Endpoint(shortcode)
     if (result && result.videoUrl) return result
