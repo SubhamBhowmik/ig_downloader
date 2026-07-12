@@ -30,14 +30,41 @@ setInterval(() => {
   } catch (e) {}
 }, 2 * 60 * 1000)
 
-// Build yt-dlp cookie args from session ID
-function getCookieArgs() {
+// Write session ID to a Netscape cookies file for yt-dlp
+// This is the proper way — avoids the "cookies as header" security warning
+const COOKIES_FILE = join(tmpdir(), 'ig-cookies.txt')
+let cookiesFileReady = false
+
+function ensureCookiesFile() {
+  if (cookiesFileReady) return
   if (!IG_SESSION_ID) {
     console.log('WARNING: No IG_SESSION_ID set')
-    return ''
+    return
   }
-  // Pass session cookie directly via header
-  return `--add-header "Cookie:sessionid=${IG_SESSION_ID}" --add-header "User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"`
+  try {
+    const { writeFileSync } = require('fs')
+    // Netscape cookies.txt format required by yt-dlp
+    const cookieContent = [
+      '# Netscape HTTP Cookie File',
+      '# This file is generated automatically.',
+      '',
+      // domain  domain_flag  path  secure  expiry  name  value
+      `.instagram.com\tTRUE\t/\tTRUE\t2147483647\tsessionid\t${IG_SESSION_ID}`,
+      `www.instagram.com\tTRUE\t/\tTRUE\t2147483647\tsessionid\t${IG_SESSION_ID}`,
+    ].join('\n')
+    writeFileSync(COOKIES_FILE, cookieContent, 'utf8')
+    cookiesFileReady = true
+    console.log('Cookies file written to:', COOKIES_FILE)
+  } catch (e) {
+    console.log('Failed to write cookies file:', e.message)
+  }
+}
+
+function getCookieArgs() {
+  if (!IG_SESSION_ID) return ''
+  ensureCookiesFile()
+  if (!cookiesFileReady) return ''
+  return `--cookies "${COOKIES_FILE}"`
 }
 
 function cleanInstagramUrl(rawUrl) {
