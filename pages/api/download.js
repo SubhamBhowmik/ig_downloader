@@ -179,33 +179,30 @@ export default async function handler(req, res) {
     const tempPath = join(TMP_DIR, `ig-${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`)
 
     try {
-      // Get direct video URL via yt-dlp
-      console.log(`Getting download URL for: ${cleanUrl}`)
-      const formatArg = isAudio ? 'bestaudio' : 'best'
-      const { stdout } = await execAsync(
-        `"${YT_DLP}" -f ${formatArg} --get-url --no-warnings ${cookieArgs} "${cleanUrl}"`,
-        { timeout: 30000 }
-      )
-
-      const lines = stdout.trim().split('\n').filter(l => l.startsWith('http'))
-      const fileUrl = lines[0]
-
-      if (!fileUrl) throw new Error('No download URL returned by yt-dlp')
-      console.log('Got URL:', fileUrl.substring(0, 80))
-
-      // Download the full file
-      await downloadFileToDisk(fileUrl, tempPath)
-      if (!existsSync(tempPath)) throw new Error('File not created')
-      const stat = statSync(tempPath)
-      console.log(`File size: ${stat.size} bytes`)
-
-      if (stat.size < 10000) {
-        try { unlinkSync(tempPath) } catch (e) {}
-        return res.status(500).json({ error: `File too small (${stat.size}b). Try again.` })
-      }
-
-      // If audio requested, convert to MP3
+      // For audio-only: get the audio URL and download directly
       if (isAudio) {
+        console.log(`Getting audio URL for: ${cleanUrl}`)
+        const { stdout } = await execAsync(
+          `"${YT_DLP}" -f bestaudio --get-url --no-warnings ${cookieArgs} "${cleanUrl}"`,
+          { timeout: 30000 }
+        )
+        const lines = stdout.trim().split('\n').filter(l => l.startsWith('http'))
+        const fileUrl = lines[0]
+        if (!fileUrl) throw new Error('No audio URL returned by yt-dlp')
+        console.log('Got audio URL:', fileUrl.substring(0, 80))
+
+        // Download audio
+        await downloadFileToDisk(fileUrl, tempPath)
+        if (!existsSync(tempPath)) throw new Error('File not created')
+        let audioStat = statSync(tempPath)
+        console.log(`Audio file size: ${audioStat.size} bytes`)
+
+        if (audioStat.size < 5000) {
+          try { unlinkSync(tempPath) } catch (e) {}
+          return res.status(500).json({ error: `Audio too small (${audioStat.size}b).` })
+        }
+
+        // Convert to MP3
         const mp3Path = tempPath.replace(/\.\w+$/, '.mp3')
         try {
           await execAsync(
@@ -214,11 +211,11 @@ export default async function handler(req, res) {
           )
           try { unlinkSync(tempPath) } catch (e) {}
           if (existsSync(mp3Path)) {
-            const mp3Stat = statSync(mp3Path)
+            audioStat = statSync(mp3Path)
             const encodedName = encodeURIComponent(`${safeTitle}.mp3`)
             res.writeHead(200, {
               'Content-Type': 'audio/mpeg',
-              'Content-Length': mp3Stat.size,
+              'Content-Length': audioStat.size,
               'Content-Disposition': `attachment; filename="${safeTitle}.mp3"; filename*=UTF-8''${encodedName}`,
               'Cache-Control': 'no-cache, no-store, must-revalidate',
               'Accept-Ranges': 'bytes',
@@ -231,24 +228,76 @@ export default async function handler(req, res) {
             return
           }
         } catch (ffmpegErr) {
-          console.log('ffmpeg failed, serving raw audio:', ffmpegErr.message)
+          console.log('ffmpeg conversion failed:', ffmpegErr.message)
+        }
+        // Fallback: serve raw audio
+      }
+
+      // For video: let yt-dlp download and merge video+audio directly
+      // Instagram uses DASH — video and audio are separate streams.
+      // yt-dlp + ffmpeg merge them into a single mp4.
+      console.log(`Downloading video+audio for: ${cleanUrl}`)
+      const outputTemplate = tempPath.replace(/\.\w+$/, '.%(ext)s')
+      const downloadArgs = [
+        `"${YT_DLP}"`,
+        `-f "bestvideo+bestaudio/best"`,
+        `--merge-output-format mp4`,
+        `--no-warnings`,
+        cookieArgs,
+        `--no-playlist`,
+        `--ffmpeg-location "${FFMPEG}"`,
+        `-o "${outputTemplate}"`,
+        `"${cleanUrl}"`,
+      ].join(' ')
+
+      const { stderr: dlStderr } = await execAsync(downloadArgs, {
+        timeout: 300000, // 5 min timeout for download+merge
+        maxBuffer: 50 * 1024 * 1024,
+      })
+      console.log('yt-dlp download stderr:', dlStderr?.substring(0, 200))
+
+      // yt-dlp uses the output template — find the actual file
+      const actualExt = 'mp4'
+      const actualPath = tempPath.replace(/\.\w+$/, `.${actualExt}`)
+
+      if (!existsSync(actualPath)) {
+        // Try to find any file starting with the same base name
+        const fs = require('fs')
+        const baseDir = require('path').dirname(actualPath)
+        const baseName = require('path').basename(actualPath, `.${actualExt}`)
+        const files = fs.readdirSync(baseDir).filter(f => f.startsWith(baseName))
+        if (files.length > 0) {
+          const foundPath = join(baseDir, files[0])
+          // Rename to expected path
+          if (foundPath !== actualPath) {
+            fs.renameSync(foundPath, actualPath)
+          }
         }
       }
 
-      const mimeType = isAudio ? 'audio/mpeg' : 'video/mp4'
-      const encodedName = encodeURIComponent(filename)
+      if (!existsSync(actualPath)) throw new Error('yt-dlp did not produce output file')
+      const stat = statSync(actualPath)
+      console.log(`Final file size: ${stat.size} bytes`)
+
+      if (stat.size < 10000) {
+        try { unlinkSync(actualPath) } catch (e) {}
+        return res.status(500).json({ error: `File too small (${stat.size}b). Try again.` })
+      }
+
+      const mimeType = 'video/mp4'
+      const encodedName = encodeURIComponent(`${safeTitle}.mp4`)
       res.writeHead(200, {
         'Content-Type': mimeType,
         'Content-Length': stat.size,
-        'Content-Disposition': `attachment; filename="${filename}"; filename*=UTF-8''${encodedName}`,
+        'Content-Disposition': `attachment; filename="${safeTitle}.mp4"; filename*=UTF-8''${encodedName}`,
         'Cache-Control': 'no-cache, no-store, must-revalidate',
         'Accept-Ranges': 'bytes',
         'Access-Control-Allow-Origin': '*',
       })
-      const stream = createReadStream(tempPath)
+      const stream = createReadStream(actualPath)
       stream.pipe(res)
-      stream.on('end', () => { try { unlinkSync(tempPath) } catch (e) {} })
-      stream.on('error', () => { try { unlinkSync(tempPath) } catch (e) {} })
+      stream.on('end', () => { try { unlinkSync(actualPath) } catch (e) {} })
+      stream.on('error', () => { try { unlinkSync(actualPath) } catch (e) {} })
 
     } catch (err) {
       console.error('Download error:', err.message)
