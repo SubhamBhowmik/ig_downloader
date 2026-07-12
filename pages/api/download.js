@@ -50,7 +50,7 @@ function ensureCookiesFile() {
       '',
       // domain  domain_flag  path  secure  expiry  name  value
       `.instagram.com\tTRUE\t/\tTRUE\t2147483647\tsessionid\t${IG_SESSION_ID}`,
-      `www.instagram.com\tTRUE\t/\tTRUE\t2147483647\tsessionid\t${IG_SESSION_ID}`,
+      `www.instagram.com\tFALSE\t/\tTRUE\t2147483647\tsessionid\t${IG_SESSION_ID}`,
     ].join('\n')
     writeFileSync(COOKIES_FILE, cookieContent, 'utf8')
     cookiesFileReady = true
