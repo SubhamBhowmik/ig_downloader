@@ -210,4 +210,4 @@ function formatSize(bytes) {
   let i = 0, size = bytes
   while (size >= 1024 && i < units.length - 1) { size /= 1024; i++ }
   return `${size.toFixed(1)} ${units[i]}`
-}
+}s

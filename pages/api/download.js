@@ -1,82 +1,22 @@
 import { existsSync, mkdirSync, createWriteStream, createReadStream, unlinkSync, statSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
+import { exec } from 'child_process'
+import { promisify } from 'util'
 import https from 'https'
 import http from 'http'
-import { URL } from 'url'
+
+const execAsync = promisify(exec)
+const YT_DLP = process.env.YT_DLP_PATH || 'yt-dlp'
+const FFMPEG = process.env.FFMPEG_PATH || 'ffmpeg'
+const IG_SESSION_ID = process.env.IG_SESSION_ID || ''
 
 const cache = new Map()
 const CACHE_TTL = 5 * 60 * 1000
 const TMP_DIR = join(tmpdir(), 'ig-downloads')
 if (!existsSync(TMP_DIR)) mkdirSync(TMP_DIR, { recursive: true })
 
-// Optional proxy support via environment variables
-// Set PROXY_URL for all requests
-const PROXY_URL = process.env.PROXY_URL || ''
-let _fetchWithProxy = null
-
-// Initialize proxy agent lazily (first call to fetchWithProxy)
-async function ensureProxy() {
-  if (_fetchWithProxy) return
-  if (!PROXY_URL) {
-    _fetchWithProxy = async (url, options = {}) => fetch(url, options)
-    return
-  }
-
-  try {
-    const { HttpsProxyAgent } = require('https-proxy-agent')
-    const agent = new HttpsProxyAgent(PROXY_URL)
-    console.log('Proxy agent configured:', PROXY_URL.replace(/:.*@/, ':****@'))
-    _fetchWithProxy = async (url, options = {}) => {
-      const urlObj = new URL(url)
-      const isHttps = url.startsWith('https')
-      const module = isHttps ? https : http
-      return new Promise((resolve, reject) => {
-        const req = module.request(urlObj, {
-          agent,
-          method: options.method || 'GET',
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            ...options.headers,
-          },
-          timeout: options.signal ? 15000 : undefined,
-        }, (res) => {
-          const chunks = []
-          res.on('data', chunk => chunks.push(chunk))
-          res.on('end', () => {
-            const body = Buffer.concat(chunks)
-            resolve({
-              status: res.statusCode,
-              headers: res.headers,
-              text: () => body.toString('utf8'),
-              json: () => JSON.parse(body.toString('utf8')),
-              body
-            })
-          })
-        })
-        req.on('error', reject)
-        req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')) })
-        if (options.signal) {
-          options.signal.addEventListener('abort', () => { req.destroy() })
-        }
-        if (options.body) {
-          req.write(options.body)
-        }
-        req.end()
-      })
-    }
-    console.log('Proxy fetch initialized')
-  } catch (e) {
-    console.log('Proxy agent unavailable, using direct fetch:', e.message)
-    _fetchWithProxy = async (url, options = {}) => fetch(url, options)
-  }
-}
-
-async function fetchWithProxy(url, options = {}) {
-  if (!_fetchWithProxy) await ensureProxy()
-  return _fetchWithProxy(url, options)
-}
-
+// Cleanup old temp files
 setInterval(() => {
   try {
     const fs = require('fs')
@@ -90,382 +30,23 @@ setInterval(() => {
   } catch (e) {}
 }, 2 * 60 * 1000)
 
+// Build yt-dlp cookie args from session ID
+function getCookieArgs() {
+  if (!IG_SESSION_ID) {
+    console.log('WARNING: No IG_SESSION_ID set')
+    return ''
+  }
+  // Pass session cookie directly via header
+  return `--add-header "Cookie:sessionid=${IG_SESSION_ID}" --add-header "User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"`
+}
+
 function cleanInstagramUrl(rawUrl) {
   try {
     const u = new URL(rawUrl)
     const match = u.pathname.match(/^\/(reel|p|tv)\/([A-Za-z0-9_-]+)/)
-    if (match) return { 
-      cleanUrl: 'https://www.instagram.com/' + match[1] + '/' + match[2] + '/',
-      shortcode: match[2],
-      type: match[1]
-    }
-  } catch (e) {}
-  return { cleanUrl: rawUrl, shortcode: null, type: null }
-}
-
-function decodeHtml(str) {
-  if (!str) return str
-  return str
-    .replace(/&/g, '&')
-    .replace(/"/g, '"')
-    .replace(/&#039;/g, "'")
-    .replace(/</g, '<')
-    .replace(/>/g, '>')
-    .replace(/\\u0026/g, '&')
-    .replace(/&#x2019;/g, "'")
-    .replace(/&#x201d;/g, '"')
-    .replace(/&#x201c;/g, '"')
-}
-
-// Method 1: Instagram embed page (most reliable from server IPs)
-// The /embed/ endpoint is designed for public iframe embeds and is less aggressively blocked
-async function fetchViaEmbedPage(shortcode) {
-  console.log('Trying embed page for:', shortcode)
-  try {
-    const url = 'https://www.instagram.com/p/' + shortcode + '/embed/'
-    const res = await fetchWithProxy(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-      },
-    })
-    const html = await res.text()
-
-    // Method A: Parse application/ld+json (structured data)
-    const ldMatch = html.match(/<script type="application\/ld\+json">([^<]+)<\/script>/)
-    if (ldMatch) {
-      try {
-        const ldData = JSON.parse(ldMatch[1])
-        const videoUrl = ldData?.video?.contentUrl || ldData?.contentUrl
-        const thumbnail = ldData?.thumbnailUrl?.[0] || ldData?.thumbnailUrl
-        const title = ldData?.name || ldData?.headline || 'Instagram Video'
-        if (videoUrl) {
-          console.log('Embed ld+json SUCCESS - video URL found')
-          return { videoUrl, thumbnail, title }
-        }
-      } catch (e) {
-        console.log('Embed ld+json parse error:', e.message)
-      }
-    }
-
-    // Method B: og:video meta tag
-    const ogVideoMatch = html.match(/<meta property="og:video" content="([^"]+)"/) ||
-                         html.match(/<meta content="([^"]+)" property="og:video"/) ||
-                         html.match(/<meta property="og:video:secure_url" content="([^"]+)"/) ||
-                         html.match(/<meta content="([^"]+)" property="og:video:secure_url"/)
-    if (ogVideoMatch) {
-      const videoUrl = decodeHtml(ogVideoMatch[1])
-      const imgMatch = html.match(/<meta property="og:image" content="([^"]+)"/)
-      const thumbnail = imgMatch ? decodeHtml(imgMatch[1]) : null
-      console.log('Embed og:video SUCCESS')
-      return { videoUrl, thumbnail, title: null }
-    }
-
-    // Method C: JSON data in script tags (Instagram puts __INITIAL_STATE__ in embed)
-    const stateMatch = html.match(/window\.__INITIAL_STATE__\s*=\s*({.+?});/s)
-    if (stateMatch) {
-      try {
-        const stateData = JSON.parse(stateMatch[1])
-        const media = stateData?.shortcode_media
-        if (media) {
-          const videoUrl = media.video_url || media.video_versions?.[0]?.url
-          const thumbnail = media.display_url || media.thumbnail_src
-          const title = media.edge_media_to_caption?.edges?.[0]?.node?.text || 'Instagram Video'
-          if (videoUrl) {
-            console.log('Embed __INITIAL_STATE__ SUCCESS')
-            return { videoUrl, thumbnail, title }
-          }
-        }
-      } catch (e) {
-        console.log('Embed __INITIAL_STATE__ parse error:', e.message)
-      }
-    }
-
-    // Method D: Search for video URLs in any JSON-like data in the page
-    const allScripts = html.match(/<script[^>]*>([\s\S]*?)<\/script>/gi) || []
-    for (const script of allScripts) {
-      const videoUrlMatches = script.match(/"(?:video_url|playable_url|contentUrl|downloadUrl)"\s*:\s*"(https:[^"]+)"/g)
-      if (videoUrlMatches) {
-        for (const match of videoUrlMatches) {
-          try {
-            const url = JSON.parse('{' + match + '}')['video_url'] || 
-                       JSON.parse('{' + match + '}')['playable_url'] ||
-                       JSON.parse('{' + match + '}')['contentUrl'] ||
-                       JSON.parse('{' + match + '}')['downloadUrl']
-            if (url && url.includes('cdn') && url.includes('.mp4')) {
-              console.log('Embed script scan SUCCESS - found video URL')
-              return { videoUrl: decodeHtml(url), thumbnail: null, title: null }
-            }
-          } catch (e) {}
-        }
-      }
-    }
-
-    // Method E: Search for any CDN mp4 URLs in the entire HTML
-    const cdnVideoMatch = html.match(/https:\/\/[^"'\s\\]*cdn[^"'\s\\]*\.mp4[^"'\s\\]*/i)
-    if (cdnVideoMatch) {
-      console.log('Embed CDN mp4 SUCCESS')
-      return { videoUrl: decodeHtml(cdnVideoMatch[0]), thumbnail: null, title: null }
-    }
-
-    // Method F: Fall back to og:image at least
-    const imgMatch = html.match(/<meta property="og:image" content="([^"]+)"/)
-    if (imgMatch) {
-      console.log('Embed got thumbnail only')
-      return { videoUrl: null, thumbnail: decodeHtml(imgMatch[1]), title: null }
-    }
-
-    console.log('Embed page - no video found (response length:', html.length, ')')
-  } catch (e) {
-    console.log('Embed page failed:', e.message)
-  }
-  return null
-}
-
-// Method 1b: Try ddinstagram.com (alternative frontend, less blocked)
-async function fetchViaDdInstagram(shortcode) {
-  console.log('Trying ddinstagram for:', shortcode)
-  try {
-    const url = 'https://ddinstagram.com/p/' + shortcode + '/'
-    const res = await fetchWithProxy(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml',
-      },
-    })
-    const html = await res.text()
-
-    const videoMatch = html.match(/<source src="([^"]+)" type="video\/mp4"/) ||
-                       html.match(/<video[^>]+src="([^"]+\.mp4[^"]*)"/) ||
-                       html.match(/"videoUrl":"(https:[^"]+)"/) ||
-                       html.match(/"url":"(https:[^"]+\.mp4[^"]*)"/)
-    if (videoMatch) {
-      console.log('ddinstagram SUCCESS')
-      const imgMatch = html.match(/<meta property="og:image" content="([^"]+)"/)
-      return { videoUrl: decodeHtml(videoMatch[1]), thumbnail: imgMatch ? decodeHtml(imgMatch[1]) : null, title: null }
-    }
-    console.log('ddinstagram - no video found')
-  } catch (e) {
-    console.log('ddinstagram failed:', e.message)
-  }
-  return null
-}
-
-// Method 2: Instagram's __a=1 endpoint
-async function fetchViaA1Endpoint(shortcode) {
-  console.log('Trying __a=1 endpoint for:', shortcode)
-  try {
-    const url = 'https://www.instagram.com/p/' + shortcode + '/?__a=1&__d=1'
-    const res = await fetchWithProxy(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': '*/*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Referer': 'https://www.instagram.com/',
-      },
-    })
-
-    const text = await res.text()
-    const jsonText = text.startsWith('for (;;)') ? text.substring(text.indexOf('{')) : text
-    const data = JSON.parse(jsonText)
-
-    let media = data?.items?.[0] || data?.graphql?.shortcode_media || data?.item
-    if (!media && data?.graphql) {
-      media = data.graphql.shortcode_media
-    }
-    if (!media) {
-      console.log('No media in __a=1 response')
-      return null
-    }
-
-    const videoUrl = media.video_versions?.[0]?.url || media.video_url
-    const thumbnail = media.display_url || media.image_versions2?.candidates?.[0]?.url
-    const title = media.caption?.text || media.edge_media_to_caption?.edges?.[0]?.node?.text || 'Instagram Video'
-
-    if (videoUrl) {
-      console.log('__a=1 SUCCESS - video URL found')
-      return { videoUrl, thumbnail, title }
-    }
-  } catch (e) {
-    console.log('__a=1 failed:', e.message)
-  }
-  return null
-}
-
-// Method 3: Instagram GraphQL API
-async function fetchViaGraphQL(shortcode) {
-  console.log('Trying GraphQL API for:', shortcode)
-  try {
-    const apiUrl = 'https://www.instagram.com/api/graphql'
-    const variables = JSON.stringify({
-      shortcode,
-      fetch_comment_count: 0,
-      fetch_related_count: 0,
-      child_comment_count: 0,
-      fetch_like_count: 0,
-      has_threaded_comments: false,
-    })
-
-    const res = await fetchWithProxy(apiUrl, {
-      method: 'POST',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept': '*/*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'X-IG-App-ID': '936619743392459',
-        'X-ASBD-ID': '129477',
-        'X-IG-WWW-Claim': '0',
-        'Origin': 'https://www.instagram.com',
-        'Referer': 'https://www.instagram.com/',
-      },
-      body: 'av=0&__d=www&__user=0&__a=1&__req=3&__hs=19734.HYP%3Ainstagram_web_pkg.2.1...&dpr=2&__ccg=EXCELLENT&__rev=1009050048&__s=zvqlv6%3Afxnm6z%3Ae24hmk&__hsi=7318087949012428025&__dyn=7xeUjG1mxu1syUbFp41twpUnwgU7SbzEdF8aUco2qwJyEiw9-2u3p4U2O4m85ildl0q&__csr=&__comet_req=7&fb_dtsg=&jazoest=&lsd=AVp2gEuM&__spin_r=1009050048&__spin_b=trunk&__spin_t=1702565935&fb_api_caller_class=RelayModern&fb_api_req_friendly_name=PolarisPostActionLoadPostQueryQuery&variables=' + encodeURIComponent(variables) + '&server_timestamps=true&doc_id=10015901848480474',
-    })
-
-    const text = await res.text()
-    const jsonText = text.startsWith('for (;;)') ? text.substring(text.indexOf('{')) : text
-    const data = JSON.parse(jsonText)
-
-    const media = data?.data?.xdt_shortcode_media ||
-                  data?.data?.xdt_api__v1__media__shortcode__web_info?.items?.[0] ||
-                  data?.data?.xdt_api__v1__media__shortcode__web_info?.media ||
-                  data?.data?.shortcode_media
-
-    if (!media) {
-      console.log('No media in GraphQL response')
-      return null
-    }
-
-    const videoUrl = media.video_url ||
-                    media.video_versions?.[0]?.url ||
-                    media.video?.playable_url ||
-                    media.playable_url
-
-    const thumbnail = media.display_url ||
-                     media.image_versions2?.candidates?.[0]?.url ||
-                     media.thumbnail_src
-
-    const title = media.edge_media_to_caption?.edges?.[0]?.node?.text ||
-                 media.caption?.text ||
-                 'Instagram Video'
-
-    if (videoUrl) {
-      console.log('GraphQL SUCCESS - video URL found')
-      return { videoUrl, thumbnail, title }
-    }
-  } catch (e) {
-    console.log('GraphQL failed:', e.message)
-  }
-  return null
-}
-
-// Method 4: Instagram oEmbed API
-async function fetchViaOEmbed(url) {
-  console.log('Trying oEmbed API')
-  try {
-    const oembedUrl = 'https://graph.facebook.com/v18.0/instagram_oembed?url=' + encodeURIComponent(url) + '&maxwidth=640&fields=thumbnail_url,title,html&access_token=&format=json'
-    const res = await fetchWithProxy(oembedUrl, {
-      headers: { 'User-Agent': 'Mozilla/5.0' },
-    })
-    const data = await res.json()
-    if (data.thumbnail_url) {
-      console.log('oEmbed got thumbnail')
-      return { videoUrl: null, thumbnail: data.thumbnail_url, title: data.title }
-    }
-  } catch (e) {
-    console.log('oEmbed failed:', e.message)
-  }
-  return null
-}
-
-// Method 5: Scrape HTML with multiple UAs
-async function fetchViaHtml(cleanUrl) {
-  console.log('Trying HTML scrape')
-  const userAgents = [
-    'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
-    'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
-    'Twitterbot/1.0',
-  ]
-
-  for (const ua of userAgents) {
-    try {
-      const res = await fetchWithProxy(cleanUrl, {
-        headers: {
-          'User-Agent': ua,
-          'Accept': 'text/html,application/xhtml+xml',
-          'Accept-Language': 'en-US,en;q=0.9',
-        },
-      })
-      const html = await res.text()
-
-      const videoPatterns = [
-        /<meta property="og:video(?::(?:url|secure_url))?" content="([^"]+)"/,
-        /<meta content="([^"]+)" property="og:video(?::(?:url|secure_url))?"/,
-        /"video_url":"(https:[^"]+)"/,
-        /"playable_url":"(https:[^"]+)"/,
-        /"contentUrl":"(https:[^"]+)"/,
-        /(https:\/\/[^"'\s\\]*cdn[^"'\s\\]*\.mp4[^"'\s\\]*)/i,
-      ]
-
-      for (const pattern of videoPatterns) {
-        const m = html.match(pattern)
-        if (m) {
-          const videoUrl = decodeHtml(m[1])
-          console.log('HTML scrape found video:', videoUrl.substring(0, 80))
-          const imgMatch = html.match(/<meta property="og:image" content="([^"]+)"/) ||
-                          html.match(/<meta content="([^"]+)" property="og:image"/)
-          const thumbnail = imgMatch ? decodeHtml(imgMatch[1]) : null
-          return { videoUrl, thumbnail, title: null }
-        }
-      }
-
-      const imgMatch = html.match(/<meta property="og:image" content="([^"]+)"/) ||
-                      html.match(/<meta content="([^"]+)" property="og:image"/)
-      if (imgMatch) {
-        return { videoUrl: null, thumbnail: decodeHtml(imgMatch[1]), title: null }
-      }
-    } catch (e) {
-      console.log('HTML scrape UA failed:', e.message)
-    }
-  }
-  return null
-}
-
-async function getInstagramMedia(url) {
-  const { cleanUrl, shortcode, type } = cleanInstagramUrl(url)
-
-  if (shortcode) {
-    const result = await fetchViaEmbedPage(shortcode)
-    if (result && result.videoUrl) return result
-  }
-
-  if (shortcode) {
-    const result = await fetchViaDdInstagram(shortcode)
-    if (result && result.videoUrl) return result
-  }
-
-  if (shortcode) {
-    const result = await fetchViaA1Endpoint(shortcode)
-    if (result && result.videoUrl) return result
-  }
-
-  if (shortcode) {
-    const result = await fetchViaGraphQL(shortcode)
-    if (result && result.videoUrl) return result
-  }
-
-  const htmlResult = await fetchViaHtml(cleanUrl)
-  if (htmlResult && htmlResult.videoUrl) return htmlResult
-
-  if (htmlResult && htmlResult.thumbnail) return htmlResult
-
-  if (shortcode) {
-    const oembedResult = await fetchViaOEmbed(cleanUrl)
-    if (oembedResult) return oembedResult
-  }
-
-  return { videoUrl: null, thumbnail: null, title: null }
+    if (match) return `https://www.instagram.com/${match[1]}/${match[2]}/`
+    return rawUrl
+  } catch (e) { return rawUrl }
 }
 
 function proxyImage(imageUrl, res) {
@@ -506,19 +87,23 @@ function downloadFileToDisk(fileUrl, destPath) {
       }, (remoteRes) => {
         const status = remoteRes.statusCode
         const contentType = remoteRes.headers['content-type'] || ''
-        console.log('Download: ' + status + ' type: ' + contentType + ' size: ' + remoteRes.headers['content-length'])
+        console.log(`Download response: ${status}, type: ${contentType}, size: ${remoteRes.headers['content-length']}`)
         if ([301, 302, 303, 307, 308].includes(status)) {
           const location = remoteRes.headers.location
           if (!location) return reject(new Error('No redirect location'))
           remoteRes.resume()
-          return attempt(location.startsWith('http') ? location : urlObj.protocol + '//' + urlObj.hostname + location, redirectCount + 1)
+          return attempt(location.startsWith('http') ? location : `${urlObj.protocol}//${urlObj.hostname}${location}`, redirectCount + 1)
         }
-        if (status !== 200) { remoteRes.resume(); return reject(new Error('HTTP ' + status)) }
+        if (status !== 200) { remoteRes.resume(); return reject(new Error(`HTTP ${status}`)) }
         const fileStream = createWriteStream(destPath)
         let bytes = 0
         remoteRes.on('data', c => { bytes += c.length })
         remoteRes.pipe(fileStream)
-        fileStream.on('finish', () => { fileStream.close(); console.log('Downloaded: ' + bytes + ' bytes'); resolve({ bytes, contentType }) })
+        fileStream.on('finish', () => {
+          fileStream.close()
+          console.log(`Downloaded: ${bytes} bytes`)
+          resolve({ bytes, contentType })
+        })
         fileStream.on('error', reject)
         remoteRes.on('error', reject)
       })
@@ -536,40 +121,91 @@ export default async function handler(req, res) {
   const { url, format: formatId, thumb, type, title } = req.query
   if (!url) return res.status(400).json({ error: 'Missing ?url=' })
 
+  const cleanUrl = cleanInstagramUrl(url)
+  const cookieArgs = getCookieArgs()
+
+  // ── PROXY THUMBNAIL ──
   if (thumb === '1') {
     const cached = cache.get(url)
     if (cached?.data?.thumbnail) return proxyImage(cached.data.thumbnail, res)
-    const result = await getInstagramMedia(url)
-    if (result?.thumbnail) return proxyImage(result.thumbnail, res)
+
+    try {
+      const { stdout } = await execAsync(
+        `"${YT_DLP}" -J --no-warnings ${cookieArgs} "${cleanUrl}"`,
+        { timeout: 20000, maxBuffer: 5 * 1024 * 1024 }
+      )
+      const info = JSON.parse(stdout)
+      if (info.thumbnail) return proxyImage(info.thumbnail, res)
+    } catch (e) {
+      console.log('Thumbnail fetch failed:', e.message)
+    }
     return res.status(404).json({ error: 'No thumbnail' })
   }
 
+  // ── DOWNLOAD FILE ──
   if (formatId) {
     const isAudio = type === 'audio'
-    const safeTitle = (title || 'instagram-video').replace(/[^a-zA-Z0-9\s_-]/g, '').replace(/\s+/g, '-').substring(0, 40) || 'instagram-video'
+    const safeTitle = (title || 'instagram-video')
+      .replace(/[^a-zA-Z0-9\s_-]/g, '').replace(/\s+/g, '-').substring(0, 40) || 'instagram-video'
     const ext = isAudio ? 'mp3' : 'mp4'
-    const filename = safeTitle + '.' + ext
-    const tempPath = join(TMP_DIR, 'ig-' + Date.now() + '-' + Math.random().toString(36).slice(2) + '.' + ext)
+    const filename = `${safeTitle}.${ext}`
+    const tempPath = join(TMP_DIR, `ig-${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`)
 
     try {
-      let videoUrl = null
-      const cached = cache.get(url)
-      if (cached?.data?.videoUrl) {
-        videoUrl = cached.data.videoUrl
-        console.log('Using cached video URL')
-      } else {
-        const result = await getInstagramMedia(url)
-        videoUrl = result?.videoUrl
-      }
+      // Get direct video URL via yt-dlp
+      console.log(`Getting download URL for: ${cleanUrl}`)
+      const formatArg = isAudio ? 'bestaudio' : 'best'
+      const { stdout } = await execAsync(
+        `"${YT_DLP}" -f ${formatArg} --get-url --no-warnings ${cookieArgs} "${cleanUrl}"`,
+        { timeout: 30000 }
+      )
 
-      if (!videoUrl) return res.status(500).json({ error: 'Could not find video. Post may be private or photo-only.' })
+      const lines = stdout.trim().split('\n').filter(l => l.startsWith('http'))
+      const fileUrl = lines[0]
 
-      await downloadFileToDisk(videoUrl, tempPath)
+      if (!fileUrl) throw new Error('No download URL returned by yt-dlp')
+      console.log('Got URL:', fileUrl.substring(0, 80))
+
+      // Download the full file
+      await downloadFileToDisk(fileUrl, tempPath)
       if (!existsSync(tempPath)) throw new Error('File not created')
       const stat = statSync(tempPath)
+      console.log(`File size: ${stat.size} bytes`)
+
       if (stat.size < 10000) {
         try { unlinkSync(tempPath) } catch (e) {}
-        return res.status(500).json({ error: 'File too small. Try again.' })
+        return res.status(500).json({ error: `File too small (${stat.size}b). Try again.` })
+      }
+
+      // If audio requested, convert to MP3
+      if (isAudio) {
+        const mp3Path = tempPath.replace(/\.\w+$/, '.mp3')
+        try {
+          await execAsync(
+            `"${FFMPEG}" -i "${tempPath}" -vn -acodec libmp3lame -q:a 2 "${mp3Path}" -y`,
+            { timeout: 60000 }
+          )
+          try { unlinkSync(tempPath) } catch (e) {}
+          if (existsSync(mp3Path)) {
+            const mp3Stat = statSync(mp3Path)
+            const encodedName = encodeURIComponent(`${safeTitle}.mp3`)
+            res.writeHead(200, {
+              'Content-Type': 'audio/mpeg',
+              'Content-Length': mp3Stat.size,
+              'Content-Disposition': `attachment; filename="${safeTitle}.mp3"; filename*=UTF-8''${encodedName}`,
+              'Cache-Control': 'no-cache, no-store, must-revalidate',
+              'Accept-Ranges': 'bytes',
+              'Access-Control-Allow-Origin': '*',
+            })
+            const stream = createReadStream(mp3Path)
+            stream.pipe(res)
+            stream.on('end', () => { try { unlinkSync(mp3Path) } catch (e) {} })
+            stream.on('error', () => { try { unlinkSync(mp3Path) } catch (e) {} })
+            return
+          }
+        } catch (ffmpegErr) {
+          console.log('ffmpeg failed, serving raw audio:', ffmpegErr.message)
+        }
       }
 
       const mimeType = isAudio ? 'audio/mpeg' : 'video/mp4'
@@ -577,7 +213,7 @@ export default async function handler(req, res) {
       res.writeHead(200, {
         'Content-Type': mimeType,
         'Content-Length': stat.size,
-        'Content-Disposition': 'attachment; filename="' + filename + '"; filename*=UTF-8\'\'' + encodedName,
+        'Content-Disposition': `attachment; filename="${filename}"; filename*=UTF-8''${encodedName}`,
         'Cache-Control': 'no-cache, no-store, must-revalidate',
         'Accept-Ranges': 'bytes',
         'Access-Control-Allow-Origin': '*',
@@ -586,6 +222,7 @@ export default async function handler(req, res) {
       stream.pipe(res)
       stream.on('end', () => { try { unlinkSync(tempPath) } catch (e) {} })
       stream.on('error', () => { try { unlinkSync(tempPath) } catch (e) {} })
+
     } catch (err) {
       console.error('Download error:', err.message)
       try { if (existsSync(tempPath)) unlinkSync(tempPath) } catch (e) {}
@@ -594,34 +231,41 @@ export default async function handler(req, res) {
     return
   }
 
+  // ── GET VIDEO INFO ──
   try {
     const cached = cache.get(url)
-    if (cached && Date.now() - cached.time < CACHE_TTL) return res.json(cached.data)
+    if (cached && Date.now() - cached.time < CACHE_TTL) {
+      console.log('Cache hit')
+      return res.json(cached.data)
+    }
 
-    const result = await getInstagramMedia(url)
+    console.log(`Fetching info for: ${cleanUrl}`)
+    const { stdout } = await execAsync(
+      `"${YT_DLP}" -J --no-warnings ${cookieArgs} "${cleanUrl}"`,
+      { timeout: 30000, maxBuffer: 10 * 1024 * 1024 }
+    )
+
+    const info = JSON.parse(stdout)
+    console.log('yt-dlp success, title:', info.title?.substring(0, 50))
+
     const igMatch = url.match(/\/(reel|p|tv)\/([A-Za-z0-9_-]+)/)
     const igId = igMatch ? igMatch[2] : 'post'
     const igType = igMatch ? igMatch[1] : 'video'
-    const autoTitle = result?.title || (igType === 'reel' ? 'Instagram Reel ' + igId : 'Instagram Post ' + igId)
+    const autoTitle = info.description || info.title || (igType === 'reel' ? `Instagram Reel ${igId}` : `Instagram Post ${igId}`)
 
-    let data = {}
-    if (result?.videoUrl) {
-      data = {
-        title: autoTitle, thumbnail: result.thumbnail,
-        videoUrl: result.videoUrl, duration: 0,
-        videos: [{ quality: 'HD', format_id: 'hd', ext: 'mp4', filesize: null }],
-        audio: [{ quality: 'MP3', format_id: 'mp3', ext: 'mp3', filesize: null }]
-      }
-    } else if (result?.thumbnail) {
-      data = { title: autoTitle, thumbnail: result.thumbnail, videoUrl: null, duration: 0, videos: [], audio: [], isPhotoOnly: true }
-    } else {
-      return res.status(500).json({ error: 'Could not fetch info. Post may be private.' })
+    const data = {
+      title: autoTitle,
+      thumbnail: info.thumbnail || null,
+      duration: info.duration || 0,
+      videos: [{ quality: 'HD', format_id: 'hd', ext: 'mp4', filesize: null }],
+      audio: [{ quality: 'MP3', format_id: 'mp3', ext: 'mp3', filesize: null }]
     }
 
     cache.set(url, { data, time: Date.now() })
     return res.json(data)
+
   } catch (err) {
-    console.error('Error:', err.message)
-    return res.status(500).json({ error: 'Failed to process. Try again.' })
+    console.error('yt-dlp error:', err.message)
+    return res.status(500).json({ error: 'Failed to fetch video. Check the URL and try again.' })
   }
 }
