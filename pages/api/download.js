@@ -233,113 +233,55 @@ export default async function handler(req, res) {
         // Fallback: serve raw audio
       }
 
-      // For video: download video and audio streams separately, then merge with ffmpeg
-      // Instagram uses DASH — video and audio are separate streams.
-      console.log(`Getting video+audio URLs for: ${cleanUrl}`)
+      // For video: use yt-dlp to download and merge DASH streams directly
+      // Instagram serves video and audio as separate DASH streams.
+      // yt-dlp's internal downloader + ffmpeg handles the merge properly.
+      console.log(`Downloading video with yt-dlp for: ${cleanUrl}`)
 
-      // Get video URL
-      const { stdout: videoStdout } = await execAsync(
-        `"${YT_DLP}" -f "bestvideo" --get-url --no-warnings ${cookieArgs} "${cleanUrl}"`,
-        { timeout: 30000 }
+      // Use yt-dlp's own downloader with format selection that includes audio
+      // "bestvideo+bestaudio/best" = try to merge best video + best audio, fallback to best single
+      // --merge-output-format mp4 ensures proper mp4 container
+      const outputTemplate = tempPath.replace(/\.\w+$/, '.%(ext)s')
+      const { stdout: dlStdout, stderr: dlStderr } = await execAsync(
+        `"${YT_DLP}" -f "bestvideo+bestaudio/best" --merge-output-format mp4 --no-warnings ${cookieArgs} --no-playlist -o "${outputTemplate}" "${cleanUrl}"`,
+        { timeout: 300000, maxBuffer: 50 * 1024 * 1024 }
       )
-      const videoUrl = videoStdout.trim().split('\n').filter(l => l.startsWith('http'))[0]
-      if (!videoUrl) throw new Error('No video URL returned')
-      console.log('Got video URL:', videoUrl.substring(0, 80))
+      console.log('yt-dlp stdout:', dlStdout?.substring(0, 500))
+      console.log('yt-dlp stderr:', dlStderr?.substring(0, 500))
 
-      // Get audio URL
-      let audioUrl = null
-      try {
-        const { stdout: audioStdout } = await execAsync(
-          `"${YT_DLP}" -f "bestaudio" --get-url --no-warnings ${cookieArgs} "${cleanUrl}"`,
-          { timeout: 30000 }
-        )
-        audioUrl = audioStdout.trim().split('\n').filter(l => l.startsWith('http'))[0]
-        if (audioUrl) console.log('Got audio URL:', audioUrl.substring(0, 80))
-      } catch (e) {
-        console.log('No separate audio stream found:', e.message)
+      // Find the output file (yt-dlp replaces %(ext)s with actual extension)
+      const fs = require('fs')
+      const pathMod = require('path')
+      const baseDir = pathMod.dirname(tempPath)
+      const baseName = pathMod.basename(tempPath, pathMod.extname(tempPath))
+      const files = fs.readdirSync(baseDir).filter(f => f.startsWith(baseName))
+      if (files.length === 0) throw new Error('yt-dlp did not produce output file')
+
+      const actualPath = join(baseDir, files[0])
+      console.log(`Found output file: ${files[0]}`)
+
+      const stat = statSync(actualPath)
+      console.log(`Final file size: ${stat.size} bytes`)
+
+      if (stat.size < 10000) {
+        try { unlinkSync(actualPath) } catch (e) {}
+        return res.status(500).json({ error: `File too small (${stat.size}b). Try again.` })
       }
 
-      const videoPath = tempPath.replace(/\.\w+$/, '-video.mp4')
-      const audioPath = tempPath.replace(/\.\w+$/, '-audio.m4a')
-      const outputPath = tempPath.replace(/\.\w+$/, '-merged.mp4')
-
-      // Download video
-      console.log('Downloading video stream...')
-      await downloadFileToDisk(videoUrl, videoPath)
-      if (!existsSync(videoPath)) throw new Error('Video file not created')
-      let videoStat = statSync(videoPath)
-      console.log(`Video size: ${videoStat.size} bytes`)
-
-      if (videoStat.size < 10000) {
-        try { unlinkSync(videoPath) } catch (e) {}
-        return res.status(500).json({ error: `Video too small (${videoStat.size}b).` })
-      }
-
-      // Download audio (if available) and merge
-      if (audioUrl) {
-        console.log('Downloading audio stream...')
-        await downloadFileToDisk(audioUrl, audioPath)
-        if (existsSync(audioPath)) {
-          const audioStat = statSync(audioPath)
-          console.log(`Audio size: ${audioStat.size} bytes`)
-          if (audioStat.size > 1000) {
-            // Merge video + audio with ffmpeg
-            console.log('Merging video+audio with ffmpeg...')
-            try {
-              await execAsync(
-                `"${FFMPEG}" -i "${videoPath}" -i "${audioPath}" -c:v copy -c:a aac -map 0:v:0 -map 1:a:0 -shortest "${outputPath}" -y`,
-                { timeout: 120000 }
-              )
-              if (existsSync(outputPath)) {
-                // Use merged file
-                try { unlinkSync(videoPath) } catch (e) {}
-                try { unlinkSync(audioPath) } catch (e) {}
-                const mergedStat = statSync(outputPath)
-                console.log(`Merged file size: ${mergedStat.size} bytes`)
-
-                if (mergedStat.size > 10000) {
-                  const mimeType = 'video/mp4'
-                  const encodedName = encodeURIComponent(`${safeTitle}.mp4`)
-                  res.writeHead(200, {
-                    'Content-Type': mimeType,
-                    'Content-Length': mergedStat.size,
-                    'Content-Disposition': `attachment; filename="${safeTitle}.mp4"; filename*=UTF-8''${encodedName}`,
-                    'Cache-Control': 'no-cache, no-store, must-revalidate',
-                    'Accept-Ranges': 'bytes',
-                    'Access-Control-Allow-Origin': '*',
-                  })
-                  const stream = createReadStream(outputPath)
-                  stream.pipe(res)
-                  stream.on('end', () => { try { unlinkSync(outputPath) } catch (e) {} })
-                  stream.on('error', () => { try { unlinkSync(outputPath) } catch (e) {} })
-                  return
-                }
-                try { unlinkSync(outputPath) } catch (e) {}
-              }
-            } catch (mergeErr) {
-              console.log('ffmpeg merge failed, serving video-only:', mergeErr.message)
-            }
-          }
-          try { unlinkSync(audioPath) } catch (e) {}
-        }
-      }
-
-      // Fallback: serve video-only
-      console.log('Serving video-only (no audio stream available)')
       const mimeType = 'video/mp4'
       const encodedName = encodeURIComponent(`${safeTitle}.mp4`)
       res.writeHead(200, {
         'Content-Type': mimeType,
-        'Content-Length': videoStat.size,
+        'Content-Length': stat.size,
         'Content-Disposition': `attachment; filename="${safeTitle}.mp4"; filename*=UTF-8''${encodedName}`,
         'Cache-Control': 'no-cache, no-store, must-revalidate',
         'Accept-Ranges': 'bytes',
         'Access-Control-Allow-Origin': '*',
       })
-      const stream = createReadStream(videoPath)
+      const stream = createReadStream(actualPath)
       stream.pipe(res)
-      stream.on('end', () => { try { unlinkSync(videoPath) } catch (e) {} })
-      stream.on('error', () => { try { unlinkSync(videoPath) } catch (e) {} })
+      stream.on('end', () => { try { unlinkSync(actualPath) } catch (e) {} })
+      stream.on('error', () => { try { unlinkSync(actualPath) } catch (e) {} })
 
     } catch (err) {
       console.error('Download error:', err.message)
