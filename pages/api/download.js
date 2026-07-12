@@ -238,44 +238,45 @@ export default async function handler(req, res) {
       // yt-dlp + ffmpeg merge them into a single mp4.
       console.log(`Downloading video+audio for: ${cleanUrl}`)
       const outputTemplate = tempPath.replace(/\.\w+$/, '.%(ext)s')
-      const downloadArgs = [
-        `"${YT_DLP}"`,
-        `-f "bestvideo+bestaudio/best"`,
-        `--merge-output-format mp4`,
-        `--no-warnings`,
-        cookieArgs,
-        `--no-playlist`,
-        `--ffmpeg-location "${FFMPEG}"`,
-        `-o "${outputTemplate}"`,
-        `"${cleanUrl}"`,
-      ].join(' ')
 
-      const { stderr: dlStderr } = await execAsync(downloadArgs, {
-        timeout: 300000, // 5 min timeout for download+merge
-        maxBuffer: 50 * 1024 * 1024,
-      })
-      console.log('yt-dlp download stderr:', dlStderr?.substring(0, 200))
-
-      // yt-dlp uses the output template — find the actual file
-      const actualExt = 'mp4'
-      const actualPath = tempPath.replace(/\.\w+$/, `.${actualExt}`)
-
-      if (!existsSync(actualPath)) {
-        // Try to find any file starting with the same base name
-        const fs = require('fs')
-        const baseDir = require('path').dirname(actualPath)
-        const baseName = require('path').basename(actualPath, `.${actualExt}`)
-        const files = fs.readdirSync(baseDir).filter(f => f.startsWith(baseName))
-        if (files.length > 0) {
-          const foundPath = join(baseDir, files[0])
-          // Rename to expected path
-          if (foundPath !== actualPath) {
-            fs.renameSync(foundPath, actualPath)
-          }
+      // Use yt-dlp's default format selection which handles DASH merging
+      // bv*+ba/b = best video-only + best audio-only merged into one file
+      // yt-dlp auto-detects ffmpeg from PATH, no need for --ffmpeg-location
+      let actualPath = null
+      try {
+        const { stdout, stderr } = await execAsync(
+          `"${YT_DLP}" -f "bv*+ba/b" --merge-output-format mp4 --no-warnings ${cookieArgs} --no-playlist -o "${outputTemplate}" "${cleanUrl}"`,
+          { timeout: 300000, maxBuffer: 50 * 1024 * 1024 }
+        )
+        console.log('yt-dlp stdout:', stdout?.substring(0, 200))
+        console.log('yt-dlp stderr:', stderr?.substring(0, 300))
+      } catch (dlErr) {
+        console.log('yt-dlp bv*+ba failed:', dlErr.message)
+        // Fallback: try default format selection (still includes merge)
+        try {
+          const { stdout, stderr } = await execAsync(
+            `"${YT_DLP}" --merge-output-format mp4 --no-warnings ${cookieArgs} --no-playlist -o "${outputTemplate}" "${cleanUrl}"`,
+            { timeout: 300000, maxBuffer: 50 * 1024 * 1024 }
+          )
+          console.log('yt-dlp fallback stdout:', stdout?.substring(0, 200))
+          console.log('yt-dlp fallback stderr:', stderr?.substring(0, 300))
+        } catch (fallbackErr) {
+          throw new Error(`yt-dlp failed: ${fallbackErr.message}`)
         }
       }
 
-      if (!existsSync(actualPath)) throw new Error('yt-dlp did not produce output file')
+      // Find the output file (yt-dlp replaces %(ext)s with actual extension)
+      const fs = require('fs')
+      const pathMod = require('path')
+      const baseDir = pathMod.dirname(tempPath)
+      const baseName = pathMod.basename(tempPath, pathMod.extname(tempPath))
+      const files = fs.readdirSync(baseDir).filter(f => f.startsWith(baseName))
+      if (files.length === 0) throw new Error('yt-dlp did not produce output file')
+
+      // Use the first matching file
+      actualPath = join(baseDir, files[0])
+      console.log(`Found output file: ${files[0]}`)
+
       const stat = statSync(actualPath)
       console.log(`Final file size: ${stat.size} bytes`)
 
