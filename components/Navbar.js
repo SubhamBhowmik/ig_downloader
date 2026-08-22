@@ -6,7 +6,10 @@ export default function Navbar() {
 
   return (
     <nav className="navbar">
-      <Link href="/" className="logo">ReelSnap</Link>
+      <Link href="/" className="logo">
+        <img src="/favicon.svg" alt="ReelSnap logo" className="logo-icon" />
+        <span>ReelSnap</span>
+      </Link>
       
       <button 
         className="mobile-menu-btn"

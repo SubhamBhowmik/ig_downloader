@@ -69,8 +69,12 @@ export default function Home() {
       <Head>
         <title>Instagram Video Downloader - Free HD | ReelSnap</title>
         <meta name="google-site-verification" content="JHOhQq4YK5doBetkUREfJgItx8q_IVPDpdylrd0GyYM" />
-        <meta name="description" content="Download and convert Instagram Reels, Videos, Stories to MP4 for free. Snap and save Instagram videos in HD quality. No login required. Works on all devices." />
+        <meta name="description" content="Download and convert Instagram videos, Reels, Stories to MP4 for free. Snap and save Instagram videos in HD quality. No login required. Works on all devices." />
         <meta name="keywords" content="instagram video downloader, download instagram reels, convert instagram reel to mp4, snap instagram video, download reels free, instagram reels downloader" />
+        <meta property="og:type" content="website" />
+        <meta property="og:url" content="https://reelsnap.app/" />
+        <meta property="og:title" content="Instagram Video Downloader - Free HD | ReelSnap" />
+        <meta property="og:description" content="Download and convert Instagram Reels, Videos, Stories to MP4 and MP3 for free. No login, no watermark, HD quality." />
         <link rel="canonical" href="https://reelsnap.app/" />
         <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(schemaFAQ) }} />
         <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(schemaWebApp) }} />

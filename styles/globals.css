@@ -47,13 +47,27 @@ body {
 }
 
 .navbar .logo {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
   font-size: 1.5rem;
   font-weight: 700;
+  text-decoration: none;
+}
+
+.navbar .logo > span {
   background: linear-gradient(135deg, var(--accent), var(--primary));
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   background-clip: text;
-  text-decoration: none;
+}
+
+.navbar .logo-icon {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  flex-shrink: 0;
+  display: block;
 }
 
 .navbar .nav-links {
@@ -254,6 +268,12 @@ body {
 
   .navbar .logo {
     font-size: 1.25rem;
+  }
+
+  .navbar .logo-icon {
+    width: 28px;
+    height: 28px;
+    border-radius: 7px;
   }
 }
 

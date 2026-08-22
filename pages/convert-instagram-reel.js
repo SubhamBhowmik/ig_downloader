@@ -64,6 +64,10 @@ export default function ConvertInstagramReel() {
         <title>Convert Instagram Reel to MP4 Free Online | ReelSnap</title>
         <meta name="description" content="Convert Instagram Reels to MP4 or MP3 for free online. Fast, easy Instagram Reel converter with no watermark. No login required. Works on iPhone, Android and PC." />
         <meta name="keywords" content="convert instagram reel to mp4, instagram reel converter, convert reel to mp4, instagram reel to mp4, convert instagram video, reel converter online" />
+        <meta property="og:type" content="website" />
+        <meta property="og:url" content="https://reelsnap.app/convert-instagram-reel" />
+        <meta property="og:title" content="Convert Instagram Reel to MP4 Free Online | ReelSnap" />
+        <meta property="og:description" content="Convert Instagram Reels to MP4 or MP3 for free online. No watermark, no login. Works on iPhone, Android and PC." />
         <link rel="canonical" href="https://reelsnap.app/convert-instagram-reel" />
         <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(schemaFAQ) }} />
         <script type="application/ld+json" dangerouslySetInnerHTML={{ __html: JSON.stringify(schemaWebApp) }} />
